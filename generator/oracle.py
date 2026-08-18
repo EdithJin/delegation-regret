@@ -39,6 +39,7 @@ in this module hard-codes them; they all live in CostModel.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import permutations
 
@@ -341,6 +342,12 @@ def is_tier_a(results: list[PlanResult], tol: float = 1e-9) -> bool:
 def optimal_k_intervals(results: list[PlanResult]) -> list[tuple[float, float, int]]:
     """For which beta is each spawn count k optimal? Returns (lo, hi, k), sorted.
 
+    The intervals partition [0, inf): the first starts at 0.0 and the last ends
+    at `math.inf`, because past the largest breakpoint the argmin cannot change
+    again. That upper edge is reported as infinity rather than as a large finite
+    number so no caller can mistake a padding value for a real breakpoint and
+    print a ceiling this analysis never derived.
+
     This is section 6's implied-beta estimator, and it replaces the doc's
     C*(k), L*(k) construction, which is not well defined: "the best partition
     with exactly k blocks" has no meaning without a beta, and taking cost from
@@ -366,11 +373,13 @@ def optimal_k_intervals(results: list[PlanResult]) -> list[tuple[float, float, i
                 b = (ci - cj) / (lj - li)
                 if b > 1e-9:
                     bps.add(b)
-    edges = sorted(bps) + [max(bps) * 2 + 1.0]
+    edges = sorted(bps) + [math.inf]
     out: list[tuple[float, float, int]] = []
     for lo, hi in zip(edges, edges[1:]):
-        mid = (lo + hi) / 2
-        k = min(lines, key=lambda L: L[0] + mid * L[1])[2]
+        # Any interior point identifies the interval's argmin; the boundaries are
+        # ties by construction. On the unbounded tail, lo + 1 is interior.
+        probe = lo + 1.0 if hi == math.inf else (lo + hi) / 2
+        k = min(lines, key=lambda L: L[0] + probe * L[1])[2]
         if out and out[-1][2] == k:
             out[-1] = (out[-1][0], hi, k)
         else:

@@ -14,6 +14,7 @@ price of latency.
 
 from __future__ import annotations
 
+import math
 import time
 
 from .dag import DAG, sample_dag
@@ -103,11 +104,11 @@ def section_3_implied_beta(dags: dict[str, DAG], priced: dict[str, list]) -> Non
     for name in dags:
         spans = optimal_k_intervals(priced[name])
         print(f"  {name}")
-        for i, (lo, hi, k) in enumerate(spans):
+        for lo, hi, k in spans:
             plural = "" if k == 1 else "s"
-            # The final interval's upper edge is an open-ended sentinel, not a
-            # real breakpoint -- printing it would invent a ceiling.
-            if i == len(spans) - 1:
+            # The last interval runs to infinity: past the largest breakpoint the
+            # answer cannot change again, so there is no ceiling to print.
+            if hi == math.inf:
                 rng = f"beta >= ${lo:<6.2f}          "
             else:
                 rng = f"${lo:>6.2f} <= beta < ${hi:<6.2f}"
