@@ -1,0 +1,340 @@
+"""A fake provider that REFUSES malformed conversations.
+
+`fake_upstream.FakeUpstream` serves canned bytes so the proxy's parser can be
+checked. This one exists for the opposite direction: it checks what the harness
+*sends*.
+
+WHY A PERMISSIVE FAKE WOULD BE WORSE THAN NONE. The risky half of a client is not
+reading a response -- a wrong field yields a zero and a test catches it. It is
+BUILDING THE NEXT REQUEST. Both providers impose conversation invariants that a
+canned server would happily ignore and a real endpoint rejects with a 400:
+
+  * Anthropic requires every `tool_use` block in an assistant message to be
+    answered by a `tool_result` in the very next user message, matched by id, and
+    all of them in ONE user message.
+  * OpenAI requires every entry in `tool_calls` to be answered by its own `tool`
+    message carrying the matching `tool_call_id`.
+
+Break either and a single-turn test still passes -- there is no second turn to
+reject. Delegation is precisely where the second turn matters: the lead emits a
+`spawn_subagent` call, the subagent runs, and its summary has to travel back as a
+well-formed tool result or the lead's next request is rejected. So the return
+path cannot be verified by a fake that accepts anything.
+
+This server therefore validates first and answers second, and a violation comes
+back as an HTTP 400 with the reason, which surfaces in the trace as a failed turn
+rather than as a silent shrug.
+
+It is scripted the same way `ScriptedClient` is -- keyed on the first line of the
+conversation's first user message -- so one test can drive a lead and several
+subagents through the real wire formats.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+__all__ = ["Turn", "ProtocolError", "ProtocolUpstream"]
+
+
+class ProtocolError(Exception):
+    """The harness sent something a real endpoint would reject."""
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One scripted assistant reply: some text and some tool calls."""
+
+    text: str = ""
+    tools: tuple[tuple[str, dict], ...] = ()  # (name, arguments)
+    input_tokens: int = 900
+    output_tokens: int = 120
+    cache_read_tokens: int = 0
+
+
+# ------------------------------------------------------------- validation
+
+
+def _validate_anthropic(payload: dict) -> str:
+    if not isinstance(payload.get("system"), str) or not payload["system"]:
+        raise ProtocolError("anthropic: system prompt missing")
+    if not payload.get("tools"):
+        raise ProtocolError("anthropic: no tools offered")
+    for tool in payload["tools"]:
+        if not {"name", "description", "input_schema"} <= set(tool):
+            raise ProtocolError(f"anthropic: malformed tool spec {sorted(tool)}")
+
+    messages = payload.get("messages") or []
+    if not messages or messages[0].get("role") != "user":
+        raise ProtocolError("anthropic: conversation must open with a user message")
+
+    pending: set[str] = set()  # tool_use ids awaiting a result
+    first_user = ""
+    for i, message in enumerate(messages):
+        role = message.get("role")
+        expected = "user" if i % 2 == 0 else "assistant"
+        if role != expected:
+            raise ProtocolError(f"anthropic: message {i} is {role!r}, expected {expected!r}")
+        content = message.get("content")
+        if role == "user" and isinstance(content, str):
+            first_user = first_user or content
+            if pending:
+                raise ProtocolError(f"anthropic: tool_use {sorted(pending)} never answered")
+            continue
+        if not isinstance(content, list) or not content:
+            raise ProtocolError(f"anthropic: message {i} has empty content")
+
+        if role == "assistant":
+            if pending:
+                raise ProtocolError(f"anthropic: tool_use {sorted(pending)} never answered")
+            pending = {b["id"] for b in content if b.get("type") == "tool_use"}
+        else:
+            answered = {b.get("tool_use_id") for b in content if b.get("type") == "tool_result"}
+            stray = answered - pending
+            if stray:
+                raise ProtocolError(f"anthropic: tool_result for unknown id(s) {sorted(stray)}")
+            missing = pending - answered
+            if missing:
+                raise ProtocolError(
+                    f"anthropic: {sorted(missing)} left unanswered in the next user message"
+                )
+            pending = set()
+    if pending:
+        raise ProtocolError(f"anthropic: conversation ends with unanswered {sorted(pending)}")
+    return first_user
+
+
+def _validate_openai(payload: dict) -> str:
+    messages = payload.get("messages") or []
+    if not messages or messages[0].get("role") != "system":
+        raise ProtocolError("openai: conversation must open with a system message")
+    if not payload.get("tools"):
+        raise ProtocolError("openai: no tools offered")
+    for tool in payload["tools"]:
+        if tool.get("type") != "function" or "function" not in tool:
+            raise ProtocolError("openai: malformed tool spec")
+
+    first_user = ""
+    pending: list[str] = []
+    for i, message in enumerate(messages):
+        role = message.get("role")
+        if role == "user":
+            first_user = first_user or (message.get("content") or "")
+        if role == "tool":
+            if not pending:
+                raise ProtocolError(f"openai: tool message {i} answers nothing")
+            if message.get("tool_call_id") != pending[0]:
+                raise ProtocolError(
+                    f"openai: tool message {i} has id {message.get('tool_call_id')!r}, "
+                    f"expected {pending[0]!r} (results must follow in order)"
+                )
+            pending.pop(0)
+            continue
+        if pending:
+            raise ProtocolError(f"openai: tool_calls {pending} never answered before a {role}")
+        if role == "assistant":
+            pending = [c["id"] for c in (message.get("tool_calls") or [])]
+    if pending:
+        raise ProtocolError(f"openai: conversation ends with unanswered {pending}")
+    return first_user
+
+
+# ---------------------------------------------------------------- responses
+
+
+def _anthropic_body(turn: Turn, model: str) -> dict:
+    content: list[dict] = []
+    if turn.text:
+        content.append({"type": "text", "text": turn.text})
+    for i, (name, arguments) in enumerate(turn.tools):
+        content.append({"type": "tool_use", "id": f"toolu_{i}", "name": name, "input": arguments})
+    if not content:
+        content.append({"type": "text", "text": "(no output)"})
+    return {
+        "id": "msg_p",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": "tool_use" if turn.tools else "end_turn",
+        "usage": {
+            "input_tokens": turn.input_tokens,
+            "output_tokens": turn.output_tokens,
+            "cache_read_input_tokens": turn.cache_read_tokens,
+            "cache_creation_input_tokens": 0,
+        },
+    }
+
+
+def _openai_body(turn: Turn, model: str) -> dict:
+    message: dict = {"role": "assistant", "content": turn.text or None}
+    if turn.tools:
+        message["tool_calls"] = [
+            {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+            for i, (name, arguments) in enumerate(turn.tools)
+        ]
+    return {
+        "id": "chatcmpl-p",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if turn.tools else "stop",
+            }
+        ],
+        # prompt_tokens is INCLUSIVE of cached tokens here, which is the
+        # difference the client has to undo. Building it that way on purpose so
+        # a client that forgets is caught.
+        "usage": {
+            "prompt_tokens": turn.input_tokens + turn.cache_read_tokens,
+            "completion_tokens": turn.output_tokens,
+            "prompt_tokens_details": {"cached_tokens": turn.cache_read_tokens},
+        },
+    }
+
+
+# ------------------------------------------------------------------- server
+
+
+@dataclass
+class ProtocolUpstream:
+    """A validating fake for one provider, scripted per conversation."""
+
+    flavor: str  # "anthropic" | "openai"
+    script: dict[str, list[Turn]] = field(default_factory=dict)
+    model: str = "fake-model"
+    host: str = "127.0.0.1"
+    violations: list[str] = field(default_factory=list)
+    requests: list[dict] = field(default_factory=list)
+    # Seconds of simulated generation per output token. Zero by default, because
+    # most tests do not care and sleeping makes them slow. Calibration tests DO
+    # care: `fit_timing_model` regresses duration on token counts, so against a
+    # server that answers instantly the fit sees noise and correctly refuses to
+    # identify throughput. A realistic-shaped duration is what makes the timing
+    # half of a calibration testable at all.
+    seconds_per_output_token: float = 0.0
+    # Prefill: duration that scales with the context being read, not with what is
+    # generated. Needed INDEPENDENTLY of the output term, because
+    # `fit_timing_model` has to separate the two and refuses when they are
+    # collinear -- a fake whose latency depends only on output length cannot
+    # exercise the prefill half of the model at all.
+    seconds_per_input_token: float = 0.0
+    base_latency_s: float = 0.0
+    # Which script answers a request. Defaults to the first line of the first
+    # user message. Overridden when two conversations open with the same line --
+    # forced-serial and forced-fanout leads both start from the same task list
+    # and differ only in the plan directive appended to it.
+    key_from: object = None
+
+    def __post_init__(self) -> None:
+        if self.flavor not in ("anthropic", "openai"):
+            raise ValueError(f"unknown flavor {self.flavor!r}")
+        self._lock = threading.Lock()
+        self._server = ThreadingHTTPServer((self.host, 0), self._handler())
+        self._server.daemon_threads = True
+        self._thread: threading.Thread | None = None
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> "ProtocolUpstream":
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def __enter__(self) -> "ProtocolUpstream":
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def _turn_for(self, key: str, payload: dict) -> Turn:
+        """Which scripted turn answers this request.
+
+        Derived from the request itself -- the number of assistant messages
+        already in the history -- rather than from a per-key counter. A counter
+        cannot serve the same conversation twice, and calibration deliberately
+        replays one forced-serial run several times: the second replay would get
+        whatever the first left on the cursor, which is the trailing `finish`, so
+        it would write nothing and silently produce a run with no boundaries.
+        Found exactly that way.
+
+        Stateless also means thread-safe, which matters because fan-out runs
+        several subagent conversations at once.
+        """
+        turns = self.script.get(key) or self.script.get("*")
+        if turns is None:
+            raise ProtocolError(f"no script for {key!r}; keys are {sorted(self.script)}")
+        index = sum(1 for m in payload.get("messages", []) if m.get("role") == "assistant")
+        return turns[min(index, len(turns) - 1)]
+
+    def _handler(self):
+        upstream = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                with upstream._lock:
+                    upstream.requests.append(payload)
+                try:
+                    if upstream.flavor == "anthropic":
+                        first_user = _validate_anthropic(payload)
+                    else:
+                        first_user = _validate_openai(payload)
+                    if callable(upstream.key_from):
+                        key = upstream.key_from(first_user or "")
+                    else:
+                        key = (first_user or "").splitlines()[0].strip() or "lead"
+                        if key.startswith("Read TASKS.md"):
+                            key = "lead"
+                    turn = upstream._turn_for(key, payload)
+                except ProtocolError as exc:
+                    with upstream._lock:
+                        upstream.violations.append(str(exc))
+                    return self._send(400, {"error": {"message": str(exc)}})
+                body = (
+                    _anthropic_body(turn, upstream.model)
+                    if upstream.flavor == "anthropic"
+                    else _openai_body(turn, upstream.model)
+                )
+                delay = (
+                    upstream.base_latency_s
+                    + upstream.seconds_per_output_token * turn.output_tokens
+                    + upstream.seconds_per_input_token * turn.input_tokens
+                )
+                if delay:
+                    time.sleep(delay)
+                self._send(200, body)
+
+            def _send(self, status: int, payload: dict) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return Handler

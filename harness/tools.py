@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -137,11 +138,44 @@ class ToolCall:
 
 @dataclass
 class Workspace:
-    """A scenario directory an agent may act inside, and nowhere else."""
+    """A scenario directory an agent may act inside, and nowhere else.
+
+    `actor` and `writes` exist for one reason: section 5.4 needs to know WHICH
+    loop produced each node's result, and says to capture it AT THE MOMENT OF
+    THE WRITE because it cannot be recovered afterwards. Reconstructing it later
+    from timestamps is guesswork -- two subagents writing concurrently have
+    interleaved clocks, and the lead writes in between. Here the answer is
+    simply known: the loop calling `write_file` labelled itself when it built
+    its view of the workspace.
+
+    Several Workspace instances share one root and one `writes` list -- the lead
+    and each subagent get their own, differing only in `actor`. The list is
+    appended under `lock` because subagents run concurrently.
+    """
 
     root: Path
     calls: list[ToolCall] = field(default_factory=list)
     python_timeout: float = 30.0
+    actor: str = "lead"
+    writes: list[tuple[str, str, float]] = field(default_factory=list)  # (path, actor, t), in order
+    lock: object = field(default_factory=threading.Lock)
+    clock: object = None  # callable -> seconds since the run began
+
+    def view(self, actor: str) -> "Workspace":
+        """A second handle on the same directory, labelled for another loop.
+
+        Shares `writes` and `lock` -- attribution is one record across the whole
+        run -- but takes its own `calls` list, since a subagent's tool calls are
+        its own trace and must not be mixed into the lead's.
+        """
+        return Workspace(
+            root=self.root,
+            python_timeout=self.python_timeout,
+            actor=actor,
+            writes=self.writes,
+            lock=self.lock,
+            clock=self.clock,
+        )
 
     def _resolve(self, path: str) -> Path:
         target = (self.root / path).resolve()
@@ -173,6 +207,11 @@ class Workspace:
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        # Attribution, recorded here and nowhere else. See the class docstring.
+        rel = target.relative_to(self.root.resolve()).as_posix()
+        when = float(self.clock()) if callable(self.clock) else 0.0
+        with self.lock:
+            self.writes.append((rel, self.actor, when))
         return f"wrote {len(content)} characters to {path}"
 
     def run_python(self, code: str) -> str:
@@ -235,6 +274,30 @@ class Workspace:
             },
             "spawns": sum(1 for c in self.calls if c.name == "spawn_subagent"),
         }
+
+    def attribution(self) -> dict[str, str]:
+        """path -> the actor that wrote it LAST.
+
+        Last writer wins, because that is whose content the verifier graded. A
+        path written by more than one actor is reported by `contested_writes`
+        rather than silently resolved -- it means two loops touched one node's
+        module, which the disjoint-footprint guarantee says should not happen.
+        """
+        out: dict[str, str] = {}
+        with self.lock:
+            for path, actor, _ in self.writes:
+                out[path] = actor
+        return out
+
+    def contested_writes(self) -> dict[str, tuple[str, ...]]:
+        """path -> every distinct actor that wrote it, where that is more than one."""
+        seen: dict[str, list[str]] = {}
+        with self.lock:
+            for path, actor, _ in self.writes:
+                bucket = seen.setdefault(path, [])
+                if actor not in bucket:
+                    bucket.append(actor)
+        return {p: tuple(a) for p, a in seen.items() if len(a) > 1}
 
 
 def parse_arguments(raw: object) -> dict:
