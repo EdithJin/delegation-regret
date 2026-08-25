@@ -27,14 +27,23 @@ __all__ = ["Node", "DAG", "wide_independent", "chain", "diamond", "mixed", "samp
 class Node:
     """One executable subtask.
 
-    family: template family (section 4 Stage 2). Independent nodes drawn from
-        the same family still get disjoint file footprints by construction, so
-        concurrent subagents never collide -- section 7's parallel-workspace rule.
-    size:   nominal work units. Calibration turns this into tokens and minutes.
+    `size` is nominal work units -- calibration turns it into tokens and minutes
+    -- and it is the ONLY property that reaches the oracle. That is deliberate
+    and load-bearing: `block_dollars` prices a block on TOTAL SIZE UNITS and not
+    on which nodes compose it, which is what lets a handful of calibration runs
+    price thousands of plans instead of running them.
+
+    A `family` field naming which template instantiated the node used to sit
+    here, and it went unread the moment the transformation payload that used it
+    was replaced by bug injection. Reintroducing one is not free labelling: it
+    would mean nodes of equal size cost different amounts, which is precisely
+    the units-not-identity assumption the cost model rests on. If heterogeneous
+    subtasks are wanted, the honest route is `calibrate.curve_disagreement` over
+    varied block COMPOSITIONS, which measures whether that assumption survives
+    rather than quietly voiding it.
     """
 
     id: str
-    family: str = "generic"
     size: int = 1
 
 
@@ -134,30 +143,28 @@ class DAG:
 # are load-bearing: they are the aggregation unit, not documentation.
 
 
-def _nodes(n: int, families: list[str], sizes: list[int], rng: random.Random) -> tuple[Node, ...]:
-    return tuple(
-        Node(id=f"n{i}", family=rng.choice(families), size=rng.choice(sizes)) for i in range(n)
-    )
+def _nodes(n: int, sizes: list[int], rng: random.Random) -> tuple[Node, ...]:
+    return tuple(Node(id=f"n{i}", size=rng.choice(sizes)) for i in range(n))
 
 
-def wide_independent(n: int, families=("generic",), sizes=(1,), rng=None) -> DAG:
+def wide_independent(n: int, sizes=(1,), rng=None) -> DAG:
     """n independent nodes. Fan-out's best case; always-serial's worst."""
     rng = rng or random.Random(0)
-    return DAG(_nodes(n, list(families), list(sizes), rng), frozenset(), "wide")
+    return DAG(_nodes(n, list(sizes), rng), frozenset(), "wide")
 
 
-def chain(n: int, families=("generic",), sizes=(1,), rng=None) -> DAG:
+def chain(n: int, sizes=(1,), rng=None) -> DAG:
     """A strict chain n0 -> n1 -> ... Fan-out buys nothing and pays spawn cost.
 
     This is also the shape the context-drag crossover class uses (section 5.1):
     at large n the serial context grows until delegating the tail wins anyway.
     """
     rng = rng or random.Random(0)
-    nodes = _nodes(n, list(families), list(sizes), rng)
+    nodes = _nodes(n, list(sizes), rng)
     return DAG(nodes, frozenset((f"n{i}", f"n{i+1}") for i in range(n - 1)), "chain")
 
 
-def diamond(width: int, families=("generic",), sizes=(1,), rng=None) -> DAG:
+def diamond(width: int, sizes=(1,), rng=None) -> DAG:
     """source -> `width` parallel middles -> sink.
 
     The interesting case: the parallel middle rewards fan-out, but the lead must
@@ -165,14 +172,14 @@ def diamond(width: int, families=("generic",), sizes=(1,), rng=None) -> DAG:
     before it can start the sink -- so the serial lead bookends bound the gain.
     """
     rng = rng or random.Random(0)
-    nodes = _nodes(width + 2, list(families), list(sizes), rng)
+    nodes = _nodes(width + 2, list(sizes), rng)
     src, sink = "n0", f"n{width + 1}"
     mids = [f"n{i}" for i in range(1, width + 1)]
     edges = {(src, m) for m in mids} | {(m, sink) for m in mids}
     return DAG(nodes, frozenset(edges), "diamond")
 
 
-def mixed(n: int, layers: int = 3, density: float = 0.4, families=("generic",), sizes=(1,), rng=None) -> DAG:
+def mixed(n: int, layers: int = 3, density: float = 0.4, sizes=(1,), rng=None) -> DAG:
     """Layered random DAG: edges only from an earlier layer to a later one.
 
     Acyclic by construction, and the layer count controls how much genuine
@@ -180,7 +187,7 @@ def mixed(n: int, layers: int = 3, density: float = 0.4, families=("generic",), 
     three hand-picked shapes.
     """
     rng = rng or random.Random(0)
-    nodes = _nodes(n, list(families), list(sizes), rng)
+    nodes = _nodes(n, list(sizes), rng)
     assign: dict[str, int] = {f"n{i}": rng.randrange(layers) for i in range(n)}
     # guarantee a non-empty first layer so the DAG has at least one root
     assign["n0"] = 0
@@ -198,7 +205,6 @@ SHAPES = {"wide": wide_independent, "chain": chain, "diamond": diamond, "mixed":
 def sample_dag(
     shape: str,
     n: int,
-    families: list[str] | tuple[str, ...] = ("generic",),
     sizes: list[int] | tuple[int, ...] = (1,),
     seed: int = 0,
 ) -> DAG:
@@ -209,7 +215,7 @@ def sample_dag(
     drives cost, and section 10's budget is priced in nodes.
     """
     rng = random.Random(seed)
-    kw = dict(families=tuple(families), sizes=tuple(sizes), rng=rng)
+    kw = dict(sizes=tuple(sizes), rng=rng)
     if shape == "diamond":
         if n < 3:
             raise ValueError("a diamond needs at least 3 nodes")

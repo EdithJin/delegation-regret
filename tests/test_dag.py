@@ -89,8 +89,8 @@ class TestDeterminism(unittest.TestCase):
     def test_same_seed_same_graph(self) -> None:
         # Scenarios are reproducible from their id; nothing is stored.
         for shape in SHAPES:
-            a = sample_dag(shape, 7, families=("x", "y"), sizes=(1, 2, 3), seed=11)
-            b = sample_dag(shape, 7, families=("x", "y"), sizes=(1, 2, 3), seed=11)
+            a = sample_dag(shape, 7, sizes=(1, 2, 3), seed=11)
+            b = sample_dag(shape, 7, sizes=(1, 2, 3), seed=11)
             self.assertEqual(a.edges, b.edges)
             self.assertEqual(a.nodes, b.nodes)
 

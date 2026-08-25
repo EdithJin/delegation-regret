@@ -9,12 +9,15 @@ correct reading is known in advance, before it is pointed at anything billable.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
 
+from generator.templates import CheckResult
 from harness.fake_upstream import EXPECTED_ANTHROPIC, EXPECTED_OPENAI, FakeUpstream
 from harness.proxy import LoggingProxy, UsageSniffer
 from harness.tools import TOOL_SPECS, Workspace, anthropic_tools, openai_tools, parse_arguments
@@ -223,6 +226,74 @@ class TestWorkspace(unittest.TestCase):
             parse_arguments("{not json")
         with self.assertRaises(ValueError):
             parse_arguments("[1, 2]")
+
+
+class TestSmokeCommandsStayWiredToTheGenerator(unittest.TestCase):
+    """Regression, and the reason the other regressions here exist.
+
+    `smoke.py` sits above the generator and below any paid run, so nothing
+    imported it and nothing exercised it. The bug-injection rewrite renamed
+    three things it depended on -- a template constant, `Scenario.seed`, and
+    `CheckResult.reason` -- and the module stopped importing entirely while a
+    green suite reported otherwise. A test that merely imports it would have
+    caught the first; these reach the other two.
+    """
+
+    def test_the_module_imports(self) -> None:
+        import harness.smoke  # noqa: F401
+
+    def test_make_scenario_builds_a_verifiable_package(self) -> None:
+        from harness.smoke import make_scenario
+
+        scenario = make_scenario("diamond", 5, 1, 3)
+        self.assertEqual(len(scenario.subtasks), 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario.materialize(tmp)
+            scenario.write_reference(tmp)
+            self.assertTrue(scenario.succeeded(tmp))
+
+    def test_preflight_reports_on_the_scenario_it_builds(self) -> None:
+        # Exercises the summary line that read the removed `Scenario.seed`.
+        # The command's exit code depends on whether node and the claude CLI
+        # are installed, which is a fact about this machine, not about the
+        # code -- so the assertion is that it runs and grades the scenario row.
+        import argparse
+
+        from harness.smoke import PASS, cmd_preflight
+
+        args = argparse.Namespace(shape="wide", n=3, size=1, seed=0, gap=0.01)
+        rows: list = []
+        import harness.smoke as smoke
+
+        original = smoke.Report.add
+
+        def capture(self, status, name, detail="") -> None:
+            rows.append((status, name, detail))
+            original(self, status, name, detail)
+
+        smoke.Report.add = capture
+        try:
+            # The command is a console report; the assertions read `rows`.
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_preflight(args)
+        finally:
+            smoke.Report.add = original
+
+        scenario_rows = [r for r in rows if "scenario materializes" in r[1]]
+        self.assertEqual(len(scenario_rows), 1)
+        self.assertEqual(scenario_rows[0][0], PASS, scenario_rows[0][2])
+
+    def test_failure_detail_reads_the_field_check_result_actually_has(self) -> None:
+        from harness.smoke import failed_detail
+
+        results = {
+            "n0": CheckResult("n0", True),
+            "n1": CheckResult("n1", False, "AssertionError: 7 != 5"),
+        }
+        detail = failed_detail(results)
+        self.assertIn("n1", detail)
+        self.assertIn("AssertionError", detail)
+        self.assertNotIn("n0", detail)
 
 
 if __name__ == "__main__":

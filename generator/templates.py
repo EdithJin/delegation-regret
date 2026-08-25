@@ -1,469 +1,405 @@
-"""Executable subtasks: the payload that makes the dependency structure real.
+"""The executable payload: working modules, generated tests, and injected defects.
 
 Design doc: Phase1-DelegationBench-Design.md section 4, Stage 2.
+Low-level design: low-level-design.md, "Stage 2".
 
-The oracle reasons about an abstract DAG. This module is what turns a node of
-that DAG into work a model can actually do and a verifier can actually check.
-Three properties are load-bearing, and each one is a design constraint rather
-than an implementation detail:
+A node's task is "make this module's tests pass." The generator writes a package
+of small modules with definite behaviour, generates a test suite by EXECUTING the
+correct version, then breaks each module in `size` distinct ways.
 
-TOKEN-HEAVY BUT MECHANICAL. Section 5.3's triangle needs subtasks with enough
-work per node that latency savings can beat spawn overhead, success probability
-near 1 so the decision stays purely economic, and a low dollar cost per run.
-Bulk renames, API ports, annotation passes, and derived tables satisfy all
-three: many tokens, no reasoning cliff, deterministic answer.
+WHY NOT TRANSFORMATIONS. The previous payload asked for bulk edits -- rename this
+helper at every call site, port these calls to a new signature -- and sized a node
+by how many call sites it had. That makes `size` count REPETITIONS OF ONE
+DECISION, and repetition is precisely what a script eliminates: an agent with a
+code-execution tool collapses the whole scenario into one find-and-replace,
+finishes in about three turns, and spawns nothing on any shape. Two things break.
+The benchmark observes no delegation decisions to score, and the cost model's
+`cost proportional to size` assumption fails, because a script over two hundred
+sites costs what a script over twenty does.
 
-DEPENDENCIES ARE REAL, NOT DECORATIVE. A node's inputs are its predecessors'
-output files. Run a chain out of order and the downstream node reads a file that
-does not exist yet, so it cannot produce the right artifact. The environment
-punishes a wrong parallelization decision on its own, before the scorer sees it.
+The fix has to live in the TASK, not the harness. Restricting the tool surface
+would work here and would not carry to Claude Code or Codex, which bring their own
+tools -- and comparing against shipped products is the point. So `size` counts
+DISTINCT decisions instead. Five unlike defects require five separate read-locate-
+fix cycles, and there is no regular expression that finds them.
 
-DISJOINT FOOTPRINTS BY CONSTRUCTION. Every node writes exactly one file, named
-for the node. Independent nodes therefore never touch the same path, so
-concurrent subagents cannot produce a merge conflict -- section 7 needs that to
-be structurally impossible rather than merely unlikely, since a conflict would
-be a confound and not a finding.
+HOW DEPENDENCIES WORK, AND HOW STRONG THEY ARE. A successor module imports its
+predecessors and calls into them, so while a predecessor is broken the successor's
+tests fail for reasons that have nothing to do with the successor. Every function
+in a successor calls a predecessor function, so a predecessor defect always
+propagates -- a dependency that bit only sometimes would be worse than none.
 
-All four families operate on the same generated module structure, indexed by the
-node's position in topological order. Because topo position strictly increases
-along every edge, the target a node transforms is distinct from every target its
-ancestors and descendants transform -- so no node's work is accidentally a no-op
-after an upstream node has run, on any shape.
+Be precise about what that buys, because it is weaker than what it replaces. The
+old file dependency was HARD: a successor read a file that did not exist until its
+predecessor ran, so it could not be completed early. This one is SOFT. An agent
+can open a successor module, find its defect, and fix it correctly while the
+predecessor is still broken -- it simply cannot CONFIRM the fix. The honest
+formulation is "no verified result for the successor until the predecessor is
+correct," not "no work on the successor." That is the dependency shape real
+software has, and the penalty for parallelising a chain is real but finite.
 
-Verification is execution-based and compares BEHAVIOUR, not text. The reference
-answer and the agent's answer are both imported in a subprocess and probed for
-what they compute, which names they define, and how they are annotated. An agent
-that reformats, reorders, or re-comments passes; an agent that renames the wrong
-symbol does not.
+The risk this creates is worth writing down where the code lives: the oracle
+models edges as strictly blocking, so if agents do make genuine out-of-order
+progress, a real agent can beat the "optimal" plan. The signature is systematic
+NEGATIVE REGRET on chain and diamond scenarios. Check traces for out-of-order
+edits and report the rate rather than assuming it is zero.
 """
 
 from __future__ import annotations
 
 import ast
-import json
-import re
-import subprocess
-import sys
-import tempfile
+import random
 from dataclasses import dataclass
-from pathlib import Path
 
 __all__ = [
+    "Defect",
     "Subtask",
     "CheckResult",
-    "FAMILIES",
-    "build_seed",
-    "merge_modules",
-    "apply_family",
-    "instruction_for",
-    "probe_source",
-    "verify_output",
-    "PROBE_ARG",
-    "TABULATE_ARG",
-    "SEED_MODULE",
+    "DEFECT_KINDS",
+    "module_path",
+    "test_path",
+    "test_module_dotted",
+    "build_module",
+    "inject",
+    "build_tests",
+    "PACKAGE",
+    "TEST_DIR",
 ]
 
-# Fixed inputs the probe and the tabulate family evaluate at. Constants, not
-# parameters: a verifier whose sampling point varies is not deterministic.
-PROBE_ARG = 7
-TABULATE_ARG = 11
+PACKAGE = "pkg"
+TEST_DIR = "tests"
 
-# Where the fixture lands in a materialized workspace. It appears in the
-# instructions, so it lives beside them rather than in the renderer.
-SEED_MODULE = "seed/base.py"
+# Probe arguments the generated tests call each function with. Fixed, small, and
+# including a negative and a zero so a defect that only shows on one sign is not
+# invisible to the suite that is supposed to catch it.
+PROBE_ARGS = (3, 0, -2, 11)
+
+
+# ------------------------------------------------------------------ the pieces
+
+
+@dataclass(frozen=True)
+class Defect:
+    """One injected fault, and where it went.
+
+    `kind` is drawn from DEFECT_KINDS. Each kind produces a different failure
+    signature, which is what stops a node from being one decision applied N
+    times: five unlike defects cannot be found by one edit.
+    """
+
+    kind: str
+    function: str
 
 
 @dataclass(frozen=True)
 class Subtask:
-    """One node's executable work, with its footprint stated explicitly.
-
-    `inputs` is what the node reads -- its predecessors' outputs, or the seed
-    file if it is a root. `output` is the single file it writes, and it is the
-    whole footprint, which is what makes independent nodes conflict-free.
-    """
+    """One node's work: a module to repair and the suite that judges it."""
 
     node_id: str
-    family: str
-    size: int
-    index: int
-    inputs: tuple[str, ...]
-    output: str
+    module: str  # "pkg/mod_n0.py" -- this node's SOLE footprint
+    test_module: str  # "tests/test_n0.py"
+    defects: tuple[Defect, ...]
+    imports: tuple[str, ...]  # predecessor node ids
+    size: int  # == len(defects)
 
     @property
     def instruction(self) -> str:
-        return instruction_for(self)
+        return (
+            f"Make the tests in `{self.test_module}` pass by repairing "
+            f"`{self.module}`. Modify no other file, and do not edit any test."
+        )
 
 
 @dataclass(frozen=True)
 class CheckResult:
     node_id: str
     passed: bool
-    reason: str = ""
+    detail: str = ""
 
     def __bool__(self) -> bool:
         return self.passed
 
 
-# ------------------------------------------------------------------ the seed
+def module_path(node_id: str) -> str:
+    return f"{PACKAGE}/mod_{node_id}.py"
+
+
+def test_path(node_id: str) -> str:
+    return f"{TEST_DIR}/test_{node_id}.py"
+
+
+def test_module_dotted(node_id: str) -> str:
+    return f"{TEST_DIR}.test_{node_id}"
+
+
+def _fn(node_id: str, i: int) -> str:
+    return f"step_{node_id}_{i}"
+
+
+# --------------------------------------------------------- generating modules
+
+
+# Body templates. Each is a single return over one integer parameter, so every
+# function has definite behaviour, runs instantly, and cannot loop forever in a
+# verifier subprocess. Variety exists so that injected defects land on genuinely
+# different structures rather than on N copies of one expression.
 #
-# One seed module serves every family. For each index i it defines a helper, a
-# deprecated two-argument operation, and `size * 3` call sites that use both.
-# A family's transformation at index i touches only the i-th group, so what a
-# node has to do is unambiguous and what it must leave alone is everything else.
+# SPLIT BY WHAT THEY ADMIT, because the split is load-bearing. Two of the five
+# defect kinds are STRUCTURAL: `swapped_branches` needs a conditional expression
+# and `inverted_condition` needs a comparison. Only the conditional bodies carry
+# either. So the body mix is not free -- it decides which defect kinds can be
+# placed at all, and a module of pure arithmetic can only ever receive arithmetic
+# defects.
+_COND_BODIES = (
+    "return ({u} + {a}) // {b} if {u} >= 0 else {u} - {b}",
+    "return {a} * {u} - {b} if {u} > {a} else {b} - {u}",
+)
+_PLAIN_BODIES = (
+    "return {u} * {a} + {b}",
+    "return ({u} - {a}) * {b}",
+    "return {u} * {u} - {a}",
+    "return abs({u} - {a}) + {b}",
+)
+_BODIES = _PLAIN_BODIES + _COND_BODIES
+
+# Kinds that need a conditional body. Everything else lands on any arithmetic.
+STRUCTURAL_KINDS = ("inverted_condition", "swapped_branches")
 
 
-def build_seed(count: int, size: int) -> str:
-    """Source for a scenario's seed module: `count` groups of `size * 3` sites."""
-    if count < 1 or size < 1:
-        raise ValueError("count and size must both be at least 1")
-    blocks = ['"""Generated fixture. Every group is independent of every other."""']
-    for i in range(count):
-        blocks.append(f"def h{i}(x):\n    return x * {2 + i} + {i}")
-        blocks.append(f"def legacy_op_{i}(a, b):\n    return a - b + {i}")
-        for j in range(size * 3):
-            blocks.append(
-                f"def g{i}_use_{j}(x):\n"
-                f"    return h{i}(x) + legacy_op_{i}(x, {j}) + {j}"
-            )
-    return "\n\n\n".join(blocks) + "\n"
+def _body_plan(size: int, rng: random.Random) -> list[str]:
+    """Which body shape each of a module's `size` functions gets.
 
+    Enough conditional bodies are reserved to let the defect deal come out
+    BALANCED -- see `inject`. A balanced deal wants each of the five kinds
+    ceil(size/5) times, and the two structural kinds need a conditional function
+    each, so the quota is 2 * ceil(size/5), capped at `size`.
 
-# ----------------------------------------------------------------- the merge
-#
-# A node with several predecessors must combine their modules before doing its
-# own work. Combining by top-level binding, later input winning a collision, is
-# deterministic and is a rule that can be stated in one sentence to an agent.
-
-
-def _binding_name(stmt: ast.stmt) -> str | None:
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return stmt.name
-    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-        target = stmt.targets[0]
-        if isinstance(target, ast.Name):
-            return target.id
-    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        return stmt.target.id
-    return None
-
-
-def _normalized(segment: str) -> str:
-    """Structure of a statement, free of formatting. Used to spot real changes."""
-    try:
-        return ast.dump(ast.parse(segment))
-    except SyntaxError:
-        return segment
-
-
-def merge_modules(sources: list[str], base: str | None = None) -> str:
-    """Union of top-level definitions; on a collision the *changed* version wins.
-
-    The obvious rule -- last source wins -- is wrong here, and wrong on the
-    shape the benchmark most depends on. Every node carries its inputs forward
-    whole, so in a diamond each middle's output still contains an untouched copy
-    of every other middle's group. Under last-wins, the middle listed last
-    overwrites its siblings' work with stale definitions, only its own changes
-    survive into the sink, and dropping any other middle changes nothing. The
-    join would be decorative: the sink would not actually need what it waited
-    for, which is exactly the property the fan-out-then-join argument rests on.
-
-    Because a node's index is its topological position, each group is owned by
-    exactly one node, so at most one input can have modified any given
-    definition and "keep the changed one" is unambiguous rather than a tiebreak.
-    Change is judged structurally, against `base`, so a node that reformatted
-    its whole module on the way past is not mistaken for one that edited it.
-
-    Statements binding no single name (imports, bare expressions) are kept under
-    synthetic keys so they survive and never collide -- an agent is free to add
-    an import, and the merge must neither lose it nor crash on it.
+    Without this the mix was whatever `rng.choice` produced, and the structural
+    kinds appeared about a quarter as often as the arithmetic ones -- not because
+    of the kind selection but because there was nowhere to put them. Two nodes of
+    equal `size` then carried materially different work, which is exactly the
+    drift the cost model cannot see.
     """
-    if len(sources) == 1:
-        return sources[0]
-    base_sigs: dict[str, str] = {}
-    if base is not None:
-        for stmt in ast.parse(base).body:
-            name = _binding_name(stmt)
-            if name is not None:
-                base_sigs[name] = _normalized(ast.get_source_segment(base, stmt) or "")
-
-    kept: dict[str, str] = {}
-    changed: set[str] = set()
-    for src in sources:
-        tree = ast.parse(src)
-        for pos, stmt in enumerate(tree.body):
-            segment = ast.get_source_segment(src, stmt) or ast.unparse(stmt)
-            name = _binding_name(stmt)
-            if name is None:
-                kept[f"__stmt_{len(kept)}_{pos}"] = segment
-                continue
-            differs = name not in base_sigs or _normalized(segment) != base_sigs[name]
-            if name in changed and not differs:
-                continue  # a stale copy must not overwrite a sibling's edit
-            kept[name] = segment
-            if differs:
-                changed.add(name)
-    return "\n\n\n".join(kept.values()) + "\n"
+    if size <= 0:
+        return []
+    want_cond = min(size, 2 * -(-size // len(DEFECT_KINDS)))
+    plan = [_COND_BODIES[i % len(_COND_BODIES)] for i in range(want_cond)]
+    plan += [_PLAIN_BODIES[i % len(_PLAIN_BODIES)] for i in range(size - want_cond)]
+    rng.shuffle(plan)
+    return plan
 
 
-# -------------------------------------------------------------- the families
+def build_module(
+    node_id: str,
+    size: int,
+    imports: tuple[str, ...],
+    rng: random.Random,
+) -> str:
+    """The CORRECT module for one node. Defects are injected separately.
 
-
-def _rename(src: str, index: int, size: int) -> str:
-    """Bulk symbol rename: `h{i}` becomes `core_{i}` at every occurrence."""
-    return re.sub(rf"\bh{index}\b", f"core_{index}", src)
-
-
-class _PortCalls(ast.NodeTransformer):
-    """`legacy_op_i(a, b)` -> `op_v2_i(b, a, mode="strict")`.
-
-    The argument swap is the point: a rename is a substitution, a port is a
-    rewrite, and an agent that reaches for a regex gets the arguments backwards.
+    Every function takes one integer and returns one integer. Functions in a
+    module with predecessors call into them, so the import edge is load-bearing
+    rather than decorative: a broken predecessor makes this module's tests fail.
     """
+    lines = [f'"""Module owned by node {node_id}."""', ""]
+    upstream: list[str] = []
+    for dep in imports:
+        # Import a fixed, known name from each predecessor. Which one it is does
+        # not matter; that it is called by every function here does.
+        lines.append(f"from {PACKAGE}.mod_{dep} import {_fn(dep, 0)}")
+        upstream.append(_fn(dep, 0))
+    if imports:
+        lines.append("")
 
-    def __init__(self, index: int) -> None:
-        self.old = f"legacy_op_{index}"
-        self.new = f"op_v2_{index}"
+    plan = _body_plan(size, rng)
+    for i in range(size):
+        a = rng.randint(2, 9)
+        b = rng.randint(2, 9)
+        body = plan[i]
+        if upstream:
+            # Route the argument through a predecessor. Every function does this,
+            # so any predecessor defect propagates into every test here.
+            call = upstream[i % len(upstream)]
+            expr = body.format(u=f"{call}(x)", a=a, b=b)
+        else:
+            expr = body.format(u="x", a=a, b=b)
+        lines += [f"def {_fn(node_id, i)}(x):", f"    {expr}", ""]
+    return "\n".join(lines).rstrip() + "\n"
 
-    def visit_Call(self, node: ast.Call) -> ast.AST:
+
+# ----------------------------------------------------------- injecting defects
+
+
+DEFECT_KINDS = (
+    "off_by_one",
+    "wrong_constant",
+    "flipped_operator",
+    "inverted_condition",
+    "swapped_branches",
+)
+
+
+class _Mutate(ast.NodeTransformer):
+    """Apply exactly one defect of a given kind inside one function."""
+
+    def __init__(self, kind: str, rng: random.Random) -> None:
+        self.kind = kind
+        self.rng = rng
+        self.done = False
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        if self.done or self.kind not in ("off_by_one", "wrong_constant"):
+            return node
+        if not isinstance(node.value, int) or isinstance(node.value, bool):
+            return node
+        self.done = True
+        options = (1, -1) if self.kind == "off_by_one" else (3, 5, -4)
+        # Never land on zero: a mutated divisor of 0 turns a findable wrong
+        # answer into a crash, which is a different and worse task.
+        deltas = [d for d in options if node.value + d != 0] or [max(options)]
+        return ast.Constant(value=node.value + self.rng.choice(deltas))
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         self.generic_visit(node)
-        if isinstance(node.func, ast.Name) and node.func.id == self.old and len(node.args) == 2:
-            return ast.Call(
-                func=ast.Name(id=self.new, ctx=ast.Load()),
-                args=[node.args[1], node.args[0]],
-                keywords=[ast.keyword(arg="mode", value=ast.Constant(value="strict"))],
-            )
-        return node
+        if self.done or self.kind != "flipped_operator":
+            return node
+        swap = {ast.Add: ast.Sub, ast.Sub: ast.Add, ast.Mult: ast.FloorDiv, ast.FloorDiv: ast.Mult}
+        repl = swap.get(type(node.op))
+        if repl is None:
+            return node
+        self.done = True
+        return ast.BinOp(left=node.left, op=repl(), right=node.right)
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if self.done or self.kind != "inverted_condition" or len(node.ops) != 1:
+            return node
+        swap = {ast.Gt: ast.LtE, ast.GtE: ast.Lt, ast.Lt: ast.GtE, ast.LtE: ast.Gt}
+        repl = swap.get(type(node.ops[0]))
+        if repl is None:
+            return node
+        self.done = True
+        return ast.Compare(left=node.left, ops=[repl()], comparators=node.comparators)
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
+        self.generic_visit(node)
+        if self.done or self.kind != "swapped_branches":
+            return node
+        self.done = True
+        return ast.IfExp(test=node.test, body=node.orelse, orelse=node.body)
 
 
-def _port(src: str, index: int, size: int) -> str:
-    tree = ast.parse(src)
-    tree = _PortCalls(index).visit(tree)
-    # Replace the deprecated definition with the new signature. Under mode
-    # "strict" the operands are taken in the swapped order, so a correctly
-    # migrated call site computes exactly what it computed before.
-    replacement = ast.parse(
-        f"def op_v2_{index}(a, b, mode='strict'):\n"
-        f"    return (b - a + {index}) if mode == 'strict' else (a - b + {index})"
-    ).body[0]
-    body = []
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef) and stmt.name == f"legacy_op_{index}":
-            body.append(replacement)
-        else:
-            body.append(stmt)
-    tree.body = body
-    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+def _applicable(fn: ast.FunctionDef, rng: random.Random) -> tuple[str, ...]:
+    """Which defect kinds can actually be placed in this function."""
+    out = []
+    for kind in DEFECT_KINDS:
+        probe = _Mutate(kind, random.Random(0))
+        probe.visit(ast.parse(ast.unparse(fn)))
+        if probe.done:
+            out.append(kind)
+    return tuple(out)
 
 
-def _annotate(src: str, index: int, size: int) -> str:
-    """Add `x: int` / `-> int` to the index's call sites. Behaviour unchanged."""
-    tree = ast.parse(src)
-    prefix = f"g{index}_use_"
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef) and stmt.name.startswith(prefix):
-            for arg in stmt.args.args:
-                arg.annotation = ast.Name(id="int", ctx=ast.Load())
-            stmt.returns = ast.Name(id="int", ctx=ast.Load())
-    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+def inject(source: str, size: int, rng: random.Random) -> tuple[str, tuple[Defect, ...]]:
+    """Break `size` distinct functions, one defect each, in a BALANCED mix.
 
+    Returns the defective source and the manifest.
 
-def _tabulate(src: str, index: int, size: int) -> str:
-    """Append `TABLE_{i}`: every call site in the group, evaluated at a fixed x.
+    WHY BALANCE IS NOT COSMETIC. `size` is the cost model's only handle on how
+    much work a node is, and `block_dollars` prices a block on total size units
+    while explicitly not looking at which nodes compose it. That approximation
+    only holds if a unit of size means the same thing everywhere. Defect kinds
+    are not equally hard to find -- a swapped conditional reads differently from
+    an off-by-one -- so a node that happened to draw three off-by-ones is not the
+    same work as one that drew five different kinds, even though both report
+    `size == 5`. The variance lands inside the measured block curve as noise and
+    the oracle mis-prices every lopsided node.
 
-    The only family that requires running the code rather than editing it, and
-    the reason the reference implementation executes the module: the answer is
-    a computed table, not a transformation of the text.
+    Measured before the fix, over 120 size-5 nodes: the two structural kinds
+    appeared 0.36-0.39 times per node against 1.32-1.48 for the arithmetic ones,
+    and single nodes carried the same kind three times.
+
+    THE DEAL. Kinds are dealt so that each appears floor(size/5) or ceil(size/5)
+    times. Functions are visited MOST-CONSTRAINED FIRST -- a conditional body
+    admits all five kinds, an arithmetic one admits only three -- because
+    assigning the flexible functions first can strand a structural kind with
+    nowhere to go. Among the kinds a function admits, the least-used wins.
+    `_body_plan` has already reserved enough conditional bodies for the deal to
+    come out even.
+
+    A defect that cannot be placed anywhere raises rather than being skipped: a
+    node claiming `size` defects while carrying fewer would make `size` mean two
+    things in one run.
     """
-    namespace: dict[str, object] = {}
-    exec(compile(src, "<reference>", "exec"), namespace)  # noqa: S102 - generator-owned source
-    prefix = f"g{index}_use_"
-    table = {
-        name: namespace[name](TABULATE_ARG)  # type: ignore[operator]
-        for name in sorted(namespace)
-        if name.startswith(prefix) and callable(namespace[name])
-    }
-    literal = ", ".join(f"{name!r}: {value!r}" for name, value in table.items())
-    return src.rstrip("\n") + f"\n\n\nTABLE_{index} = {{{literal}}}\n"
+    tree = ast.parse(source)
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    if size > len(funcs):
+        raise ValueError(f"cannot inject {size} defects into {len(funcs)} functions")
+    targets = rng.sample(funcs, size)
+
+    options = {id(fn): _applicable(fn, rng) for fn in targets}
+    for fn in targets:
+        if not options[id(fn)]:
+            raise ValueError(f"no defect kind applies to {fn.name}")
+
+    used = {kind: 0 for kind in DEFECT_KINDS}
+    # Tie-break order is shuffled PER MODULE, and that matters whenever `size` is
+    # not a multiple of the kind count. With a fixed tie-break, a size-3 node
+    # always drew the same first three kinds, so every small node in the
+    # benchmark was arithmetic-only while size-5 nodes carried structural defects
+    # too. The block curve would then measure a CHANGING MIX as size rose,
+    # conflating "more work" with "different work" -- which is precisely the
+    # confound the balanced deal exists to remove. Shuffling spreads the
+    # remainder uniformly across the population while leaving the within-node
+    # balance untouched, since `used[k]` dominates the key.
+    priority = list(DEFECT_KINDS)
+    rng.shuffle(priority)
+    # Fewest options first; assigning the flexible functions first can strand a
+    # structural kind with nowhere to go.
+    order = sorted(targets, key=lambda fn: (len(options[id(fn)]), fn.name))
+    chosen: dict[int, str] = {}
+    for fn in order:
+        pick = min(options[id(fn)], key=lambda k: (used[k], priority.index(k)))
+        chosen[id(fn)] = pick
+        used[pick] += 1
+
+    manifest: list[Defect] = []
+    for fn in targets:  # manifest follows source order, not deal order
+        kind = chosen[id(fn)]
+        mut = _Mutate(kind, rng)
+        candidate = mut.visit(ast.parse(ast.unparse(fn)))
+        if not mut.done:  # pragma: no cover -- _applicable already proved it fits
+            raise ValueError(f"{kind} failed to apply to {fn.name}")
+        tree.body[tree.body.index(fn)] = candidate.body[0]
+        manifest.append(Defect(kind=kind, function=fn.name))
+
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n", tuple(manifest)
 
 
-@dataclass(frozen=True)
-class Family:
-    name: str
-    apply: object  # (src, index, size) -> src
-    describe: object  # (subtask) -> str
+# ----------------------------------------------------------- generating tests
 
 
-def _instr_rename(t: Subtask) -> str:
-    return (
-        f"Rename the helper `h{t.index}` to `core_{t.index}` everywhere it appears, "
-        f"including every call site. Change nothing else."
-    )
+def build_tests(node_id: str, expected: dict[str, list[tuple[int, int]]]) -> str:
+    """The suite for one node, asserting values captured from the CORRECT modules.
 
-
-def _instr_port(t: Subtask) -> str:
-    return (
-        f"Migrate every call to the deprecated `legacy_op_{t.index}(a, b)` onto its "
-        f"replacement `op_v2_{t.index}(a, b, mode='strict')`, which takes its operands "
-        f"in the opposite order: a call `legacy_op_{t.index}(X, Y)` becomes "
-        f"`op_v2_{t.index}(Y, X, mode='strict')`. Replace the old definition with the "
-        f"new one so that every migrated call computes exactly what it computed before. "
-        f"Leave every other group's operations alone."
-    )
-
-
-def _instr_annotate(t: Subtask) -> str:
-    return (
-        f"Add type annotations to every function whose name starts with "
-        f"`g{t.index}_use_`: each parameter is `int` and each return is `int`. "
-        f"Do not change what any function computes."
-    )
-
-
-def _instr_tabulate(t: Subtask) -> str:
-    return (
-        f"Append a module-level dict `TABLE_{t.index}` mapping the name of every "
-        f"function whose name starts with `g{t.index}_use_` to that function's value "
-        f"at x = {TABULATE_ARG}. Keys sorted. Leave the rest of the module unchanged."
-    )
-
-
-FAMILIES: dict[str, Family] = {
-    "rename": Family("rename", _rename, _instr_rename),
-    "port": Family("port", _port, _instr_port),
-    "annotate": Family("annotate", _annotate, _instr_annotate),
-    "tabulate": Family("tabulate", _tabulate, _instr_tabulate),
-}
-
-
-def apply_family(family: str, src: str, index: int, size: int) -> str:
-    """The reference transformation for one node. Deterministic, no I/O."""
-    if family not in FAMILIES:
-        raise ValueError(f"unknown family {family!r}; expected one of {sorted(FAMILIES)}")
-    return FAMILIES[family].apply(src, index, size)  # type: ignore[operator]
-
-
-def instruction_for(subtask: Subtask) -> str:
-    """What the agent is told to do at this node, inputs and output included."""
-    family = FAMILIES[subtask.family]
-    if len(subtask.inputs) == 1:
-        source = f"Start from `{subtask.inputs[0]}`."
-    else:
-        listed = ", ".join(f"`{p}`" for p in subtask.inputs)
-        source = (
-            f"Combine the top-level definitions of {listed} into one module first. "
-            f"Where the same definition appears in more than one of them, keep the "
-            f"one that has been changed from `{SEED_MODULE}` -- at most one input "
-            f"will have changed any given definition -- and keep the unchanged form "
-            f"only if none of them changed it."
-        )
-    return f"{source} {family.describe(subtask)} Write the result to `{subtask.output}`."  # type: ignore[operator]
-
-
-# ------------------------------------------------------------ the verifier
-#
-# Execution-based and behavioural. Both the reference answer and the agent's
-# answer are imported in a subprocess and reduced to what they compute, which
-# public names they bind, and how they are annotated. Comparing that instead of
-# text is what keeps an agent's formatting choices out of the score -- and
-# section 6 forbids an LLM judge anywhere in this loop, so the comparison has to
-# be exact on something, and behaviour is the something worth being exact about.
-
-_PROBE = r'''
-import importlib.util, json, sys
-
-def canon(value):
-    if isinstance(value, dict):
-        return "dict{" + ", ".join(f"{k!r}: {canon(v)}" for k, v in sorted(value.items(), key=repr)) + "}"
-    if isinstance(value, (set, frozenset)):
-        return "set{" + ", ".join(sorted(map(repr, value))) + "}"
-    return repr(value)
-
-spec = importlib.util.spec_from_file_location("subject", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-out = {"values": {}, "annotations": {}}
-for name in sorted(vars(module)):
-    if name.startswith("_"):
-        continue
-    value = getattr(module, name)
-    if callable(value):
-        for args in ((ARG,), (ARG, 3), ()):
-            try:
-                out["values"][name] = canon(value(*args))
-                break
-            except TypeError:
-                continue
-        else:
-            out["values"][name] = "<uncallable>"
-        annotations = getattr(value, "__annotations__", None) or {}
-        out["annotations"][name] = {
-            k: getattr(v, "__name__", str(v)) for k, v in sorted(annotations.items())
-        }
-    else:
-        out["values"][name] = canon(value)
-print(json.dumps(out, sort_keys=True))
-'''
-
-
-def probe_source(source: str, timeout: float = 30.0) -> dict:
-    """Import `source` in a subprocess and report what it computes.
-
-    Raises RuntimeError if the module does not import or the probe times out --
-    both are verifier failures for the node, not crashes of the run.
+    `expected` comes from executing the pristine package, so the answer key is
+    derived rather than authored -- there is no hand-written expectation to be
+    wrong, and no model anywhere in the ground-truth path.
     """
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        subject = root / "subject_module.py"
-        subject.write_text(source, encoding="utf-8")
-        runner = root / "probe.py"
-        runner.write_text(_PROBE.replace("ARG", str(PROBE_ARG)), encoding="utf-8")
-        try:
-            done = subprocess.run(
-                [sys.executable, str(runner), str(subject)],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"probe timed out after {timeout:g}s") from None
-    if done.returncode != 0:
-        tail = (done.stderr or "").strip().splitlines()
-        raise RuntimeError(tail[-1] if tail else f"probe exited {done.returncode}")
-    return json.loads(done.stdout)
-
-
-def verify_output(actual: str | None, expected: str, node_id: str) -> CheckResult:
-    """Compare an agent's artifact against the reference answer, behaviourally.
-
-    `actual` is None when the file was never written -- the normal outcome for a
-    node whose inputs did not exist when it ran, which is exactly how an
-    incorrect parallelization decision surfaces as a failure.
-    """
-    if actual is None:
-        return CheckResult(node_id, False, "output file missing")
-    try:
-        got = probe_source(actual)
-    except RuntimeError as exc:
-        return CheckResult(node_id, False, f"artifact does not import: {exc}")
-    want = probe_source(expected)
-    if got == want:
-        return CheckResult(node_id, True)
-
-    missing = sorted(set(want["values"]) - set(got["values"]))
-    extra = sorted(set(got["values"]) - set(want["values"]))
-    if missing:
-        return CheckResult(node_id, False, f"missing definitions: {', '.join(missing[:4])}")
-    if extra:
-        return CheckResult(node_id, False, f"unexpected definitions: {', '.join(extra[:4])}")
-    wrong = [n for n in want["values"] if got["values"][n] != want["values"][n]]
-    if wrong:
-        first = wrong[0]
-        return CheckResult(
-            node_id,
-            False,
-            f"{len(wrong)} definition(s) compute the wrong value, e.g. {first}: "
-            f"got {got['values'][first]}, expected {want['values'][first]}",
-        )
-    bad = [n for n in want["annotations"] if got["annotations"].get(n) != want["annotations"][n]]
-    return CheckResult(node_id, False, f"annotations differ on {len(bad)} function(s), e.g. {bad[0]}")
+    lines = [
+        f'"""Generated suite for node {node_id}. Do not edit."""',
+        "",
+        "import unittest",
+        "",
+        f"from {PACKAGE}.mod_{node_id} import (",
+    ]
+    lines += [f"    {name}," for name in sorted(expected)]
+    lines += [")", "", "", f"class TestNode{node_id.upper()}(unittest.TestCase):"]
+    for name in sorted(expected):
+        lines.append(f"    def test_{name}(self):")
+        for arg, want in expected[name]:
+            lines.append(f"        self.assertEqual({name}({arg}), {want})")
+        lines.append("")
+    lines += ['if __name__ == "__main__":', "    unittest.main()"]
+    return "\n".join(lines) + "\n"
