@@ -40,7 +40,7 @@ from generator.dag import sample_dag
 from generator.scenario import build_scenario
 
 from .fake_upstream import EXPECTED_ANTHROPIC, EXPECTED_OPENAI, FakeUpstream
-from .proxy import ANTHROPIC_UPSTREAM, LoggingProxy
+from .proxy import ANTHROPIC_UPSTREAM, CallRecord, LoggingProxy
 from .tools import MAX_CONCURRENCY, TOOL_SPECS, Workspace, openai_tools, parse_arguments
 
 MIN_NODE_MAJOR = 18
@@ -279,15 +279,32 @@ def cmd_native(args: argparse.Namespace) -> int:
     if not records:
         return report.verdict("", "no traffic captured — check auth and ANTHROPIC_BASE_URL support.")
 
-    # Q2: is every call billable and timed? This is the measurement itself.
-    unbillable = [r.seq for r in records if not r.billable]
+    # Q2: is every successful generation call billable and timed? This is the
+    # measurement itself. Scoped to generation calls on evidence from the first
+    # real run (Aug 24): headless Claude Code also emits auxiliary traffic -- a
+    # count_tokens call, and utility-model calls that 404 against a bare API
+    # key -- which bills nothing and carries no usage block by definition.
+    # Failing on those would drop the teaser over traffic the matrix would
+    # never price; what must never lack usage is a 200 from /v1/messages.
+    def _generation(r: CallRecord) -> bool:
+        return r.status == 200 and "/count_tokens" not in r.path
+
+    generation = [r for r in records if _generation(r)]
+    auxiliary = [r for r in records if not _generation(r)]
+    unbillable = [r.seq for r in generation if not r.billable]
     report.add(
-        PASS if not unbillable else FAIL,
-        "every call carries exact token counts",
+        PASS if generation and not unbillable else FAIL,
+        "every successful generation call carries exact token counts",
         f"missing usage on call(s) {unbillable}"
         if unbillable
-        else f"in={sum(r.input_tokens or 0 for r in records)} "
-        f"out={sum(r.output_tokens or 0 for r in records)}",
+        else f"{len(generation)} generation call(s): "
+        f"in={sum(r.input_tokens or 0 for r in generation)} "
+        f"out={sum(r.output_tokens or 0 for r in generation)}"
+        + (
+            f"; {len(auxiliary)} auxiliary/failed call(s) excluded (count_tokens or non-200)"
+            if auxiliary
+            else ""
+        ),
     )
     timed = [r for r in records if r.ttfb_s > 0 and r.total_s >= r.ttfb_s]
     report.add(
