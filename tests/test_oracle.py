@@ -14,6 +14,7 @@ The rest guard the properties those corrections were derived from.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import unittest
 from itertools import permutations
@@ -21,11 +22,15 @@ from itertools import permutations
 from generator.dag import DAG, Node, sample_dag, SHAPES
 from generator.oracle import (
     CostModel,
+    OUTCOME_TOL,
     Plan,
     PlanResult,
+    all_inline,
+    block_minutes,
     enumerate_plans,
     evaluate,
     is_tier_a,
+    max_fanout,
     optimal_k_intervals,
     pareto_front,
 )
@@ -45,16 +50,9 @@ def bell(n: int) -> int:
     return row[0]
 
 
-def all_inline(dag: DAG) -> Plan:
-    return Plan(frozenset(dag.ids), ())
-
-
-def max_fanout(dag: DAG) -> Plan:
-    return Plan(frozenset(), tuple(frozenset({v}) for v in dag.ids))
-
-
 def work_minutes(dag: DAG, cm: CostModel = CM) -> float:
-    return sum(n.size for n in dag.nodes) * cm.minutes_per_unit
+    """Total serial minutes: every node, one agent, one context."""
+    return block_minutes(dag, frozenset(dag.ids), cm)
 
 
 class TestPlanSpace(unittest.TestCase):
@@ -193,9 +191,47 @@ class TestLatencyIsNotDoubleCounted(unittest.TestCase):
 
     def test_single_subagent_pays_exactly_one_brief_and_one_absorb(self) -> None:
         dag = sample_dag("chain", 6, sizes=SIZES)
+        n = dag.n
         r = evaluate(dag, Plan(frozenset(), (frozenset(dag.ids),)), CM)
-        expected = CM.explore_minutes + CM.brief_minutes + work_minutes(dag) + CM.absorb_minutes
+        # One briefing and one absorption, each AFFINE in the block's node count.
+        expected = (
+            CM.explore_minutes
+            + CM.brief_minutes + CM.brief_minutes_per_node * n
+            + work_minutes(dag)
+            + CM.absorb_minutes + CM.absorb_minutes_per_node * n
+        )
         self.assertAlmostEqual(r.latency, expected, places=9)
+
+    def test_briefing_and_absorption_scale_with_block_size(self) -> None:
+        """Regression. Dollars were charged per node and minutes flat per block,
+        though both price the SAME EMITTED TOKENS -- a briefing covering three
+        nodes is a longer instruction than one covering a single node, in money
+        and in the time the lead spends emitting it. The flat form under-charged
+        wide blocks, which made bundling several nodes into one subagent look
+        faster than it is. The fitted timing model
+        (`minutes = a + b*input_tokens + ...`) says the shape is affine, so a
+        fixed part plus a per-node part is what the model already implies."""
+        dag = sample_dag("wide", 4, sizes=SIZES)
+        ids = sorted(dag.ids)
+
+        one = evaluate(dag, Plan(frozenset(ids[1:]), (frozenset({ids[0]}),)), CM)
+        three = evaluate(dag, Plan(frozenset(ids[3:]), (frozenset(ids[:3]),)), CM)
+
+        # Same total work either way; the difference is entirely lead-side
+        # briefing and absorption on a 1-node block versus a 3-node block.
+        gap = (CM.brief_minutes_per_node + CM.absorb_minutes_per_node) * 2
+        self.assertGreater(CM.brief_minutes_per_node, 0.0, "flat briefing time is the bug")
+        self.assertAlmostEqual(three.latency - one.latency, gap, places=9)
+
+    def test_flat_briefing_time_is_recoverable_but_not_the_default(self) -> None:
+        # Zeroing the per-node terms restores the superseded flat behaviour, so
+        # the correction is a strict generalisation rather than a replacement.
+        dag = sample_dag("wide", 4, sizes=SIZES)
+        flat = CostModel(brief_minutes_per_node=0.0, absorb_minutes_per_node=0.0)
+        ids = sorted(dag.ids)
+        one = evaluate(dag, Plan(frozenset(ids[1:]), (frozenset({ids[0]}),)), flat)
+        three = evaluate(dag, Plan(frozenset(ids[3:]), (frozenset(ids[:3]),)), flat)
+        self.assertAlmostEqual(three.latency, one.latency, places=9)
 
     def test_fanout_schedule_matches_a_hand_derived_timeline(self) -> None:
         # 3 independent size-3 nodes, one subagent each. Briefings serialize on
@@ -219,7 +255,8 @@ class TestLatencyIsNotDoubleCounted(unittest.TestCase):
     def test_no_plan_finishes_before_its_critical_path(self) -> None:
         for shape in SHAPES:
             dag = sample_dag(shape, 6, sizes=SIZES)
-            floor = CM.explore_minutes + max(n.size for n in dag.nodes) * CM.minutes_per_unit
+            biggest = max(dag.nodes, key=lambda n: n.size)
+            floor = CM.explore_minutes + block_minutes(dag, frozenset({biggest.id}), CM)
             for plan in enumerate_plans(dag):
                 r = evaluate(dag, plan, CM)
                 self.assertTrue(math.isfinite(r.latency))
@@ -328,9 +365,14 @@ class TestOptimalKIntervals(unittest.TestCase):
             _, results = self._results(shape)
             for lo, hi, k in optimal_k_intervals(results):
                 for probe in _probes(lo, hi):
-                    best = min(results, key=lambda r: r.objective(probe))
+                    floor = min(r.objective(probe) for r in results)
+                    # Ties across different k are normal -- swapping two
+                    # interchangeable nodes between subagents changes the plan
+                    # and not the outcome. The estimator resolves them toward the
+                    # smallest k, so that is what must be reported.
+                    tied = {r.plan.k for r in results if r.objective(probe) <= floor + OUTCOME_TOL}
                     self.assertEqual(
-                        best.plan.k, k, f"{shape}: beta={probe} reports k={k}, argmin is {best.plan.k}"
+                        min(tied), k, f"{shape}: beta={probe} reports k={k}, smallest tied argmin is {min(tied)}"
                     )
 
     def test_every_reported_k_is_achieved_by_a_real_plan(self) -> None:
@@ -376,3 +418,68 @@ def _probes(lo: float, hi: float) -> list[float]:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProvenance(unittest.TestCase):
+    """The cost model says which of its numbers are earned. That claim has to
+    hold structurally, or the record is decoration."""
+
+    def test_every_pricing_field_carries_its_own_provenance(self) -> None:
+        # The point of putting status on the VALUE rather than in a table keyed
+        # by name: you cannot add a constant and forget to record where it came
+        # from, because a bare float reports itself as "unknown" -- which is
+        # worse than "placeholder", since nothing flags it for checking.
+        from generator.oracle import provenance
+
+        for name, status, _, _ in provenance(CostModel()):
+            self.assertNotEqual(status, "unknown", f"{name} has no recorded provenance")
+
+    def test_a_bare_value_reports_unknown_rather_than_passing_silently(self) -> None:
+        from generator.oracle import provenance
+
+        cm = dataclasses.replace(CostModel(), spawn_fixed_dollars=0.99)
+        statuses = {n: s for n, s, _, _ in provenance(cm)}
+        self.assertEqual(statuses["spawn_fixed_dollars"], "unknown")
+
+    def test_default_model_is_uncalibrated_and_names_its_guesses(self) -> None:
+        from generator.oracle import unmeasured
+
+        cm = CostModel()
+        self.assertFalse(cm.is_calibrated)
+        self.assertTrue(unmeasured(cm))
+        for name in unmeasured(cm):
+            self.assertTrue(hasattr(cm, name))
+
+    def test_calibration_is_incremental_and_keeps_the_protocol(self) -> None:
+        # Calibration happens run by run: block curves from one, spawn overhead
+        # from another. A per-model flag could not express the middle state.
+        from generator.oracle import unmeasured
+
+        cm = CostModel()
+        before = len(unmeasured(cm))
+        after = cm.calibrate("run-abc | prices 2026-08-23", spawn_fixed_dollars=0.031)
+        self.assertEqual(len(unmeasured(after)), before - 1)
+        self.assertEqual(after.spawn_fixed_dollars.status, "measured")
+        self.assertEqual(after.spawn_fixed_dollars.source, "run-abc | prices 2026-08-23")
+        self.assertEqual(float(after.spawn_fixed_dollars), 0.031)
+        # the measurement protocol survives the measurement
+        self.assertEqual(after.spawn_fixed_dollars.how, cm.spawn_fixed_dollars.how)
+        self.assertFalse(after.is_calibrated, "one constant measured is not a calibrated model")
+
+    def test_calibrating_an_unknown_name_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            CostModel().calibrate("run-abc", not_a_constant=1.0)
+
+    def test_measured_values_still_behave_as_numbers(self) -> None:
+        cm = CostModel()
+        self.assertIsInstance(cm.spawn_fixed_dollars * 3, float)
+        self.assertIsInstance(cm.concurrency_cap + 1, int)
+        self.assertEqual(len(cm.block_dollars_curve), 1)
+
+    def test_pinned_concurrency_cap_matches_the_harness(self) -> None:
+        # Provenance calls this "pinned ... must equal harness.tools.MAX_CONCURRENCY".
+        # An oracle allowed more workers than the agent can use would penalize the
+        # agent for a constraint it never faced.
+        from harness.tools import MAX_CONCURRENCY
+
+        self.assertEqual(CostModel().concurrency_cap, MAX_CONCURRENCY)

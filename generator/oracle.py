@@ -45,7 +45,155 @@ from itertools import permutations
 
 from .dag import DAG
 
-__all__ = ["CostModel", "Plan", "enumerate_plans", "evaluate", "PlanResult", "pareto_front", "is_tier_a", "optimal_k_intervals"]
+__all__ = [
+    "CostModel",
+    "Plan",
+    "enumerate_plans",
+    "evaluate",
+    "PlanResult",
+    "pareto_front",
+    "is_tier_a",
+    "optimal_k_intervals",
+    "all_inline",
+    "max_fanout",
+    "is_feasible",
+    "linear_curve",
+    "block_dollars",
+    "block_minutes",
+    "throughput_penalty",
+    "Measured",
+    "MeasuredInt",
+    "MeasuredCurve",
+    "provenance",
+    "unmeasured",
+    "OUTCOME_TOL",
+]
+
+
+# Metadata every cost constant carries: where it came from, and what breaks if
+# it is wrong. Attached to the VALUE rather than kept in a parallel table keyed
+# by name -- a table drifts, because someone adds a constant and forgets the
+# entry, or renames a field and the entry silently orphans. Here the status
+# cannot be separated from the number it describes.
+#
+# Each class subclasses the builtin it stands in for, so the value still behaves
+# as a plain float, int, or tuple in every arithmetic expression and no call site
+# had to change. (No __slots__: int and tuple are variable-layout and reject
+# them, so all three carry an ordinary __dict__.)
+#
+# Status is PER CONSTANT, not per model, because calibration is incremental: the
+# block curves come from one run and spawn overhead from another. A single
+# "is this model calibrated" flag cannot say that block cost is measured while
+# absorption is still a guess.
+
+def _stamp(obj, status, how, sensitivity, source):
+    obj.status = status  # "placeholder" | "measured" | "pinned" | "stated"
+    obj.how = how  # the measurement protocol, or why it is not measured
+    obj.sensitivity = sensitivity  # what a wrong value does to the answer
+    obj.source = source  # which run measured it, under which price sheet
+    return obj
+
+
+class Measured(float):
+    def __new__(cls, value, *, status="placeholder", how="", sensitivity="", source=""):
+        return _stamp(super().__new__(cls, value), status, how, sensitivity, source)
+
+
+class MeasuredInt(int):
+    def __new__(cls, value, *, status="placeholder", how="", sensitivity="", source=""):
+        return _stamp(super().__new__(cls, value), status, how, sensitivity, source)
+
+
+class MeasuredCurve(tuple):
+    def __new__(cls, value, *, status="placeholder", how="", sensitivity="", source=""):
+        return _stamp(super().__new__(cls, tuple(value)), status, how, sensitivity, source)
+
+
+_PROVENANCED = (Measured, MeasuredInt, MeasuredCurve)
+
+
+def provenance(cm: "CostModel") -> tuple[tuple[str, str, str, str], ...]:
+    """(name, status, how, source) for every constant, read off the fields.
+
+    Derived rather than maintained. There is no second list to keep in sync.
+    """
+    import dataclasses
+
+    out = []
+    for f in dataclasses.fields(cm):
+        v = getattr(cm, f.name)
+        if isinstance(v, _PROVENANCED):
+            out.append((f.name, v.status, v.how, v.source))
+        else:
+            # A bare value someone passed in. Unknown provenance is worse than a
+            # placeholder, because nothing records that it needs checking.
+            out.append((f.name, "unknown", "set directly, provenance not recorded", ""))
+    return tuple(out)
+
+
+def unmeasured(cm: "CostModel") -> tuple[str, ...]:
+    """Constants that are still guesses. Empty means every number is earned."""
+    return tuple(n for n, s, _, _ in provenance(cm) if s in ("placeholder", "unknown"))
+
+
+# Tolerance for "these two plans have the same outcome". Gates the Tier-A test
+# and the tie-break in `optimal_k_intervals`, so a wrong value silently changes
+# which scenarios count as persona-independent and which spawn count an
+# over-spawning agent looks consistent with.
+#
+# The default is exact float equality, which tests nothing: these are floats
+# derived from measured constants that carry confidence intervals. The value that
+# means something is the MATERIALITY FLOOR -- the smallest objective difference
+# the calibration can actually resolve -- and it cannot be known before the
+# constants are measured, which is why the default is a placeholder rather than a
+# guess dressed as a number.
+#
+# `harness.calibration.materiality_floor` derives it from a completed
+# calibration: the larger of the curve's disagreement across node orderings (the
+# dollar axis) and the timing model's residual (the minutes axis, in the units
+# the objective adds them). Pass it explicitly to `is_tier_a(results, tol=...)`
+# and the tie-break rather than mutating this constant, so one calibration does
+# not silently redefine "equal" for every other run in the process.
+OUTCOME_TOL = 1e-9
+
+
+# ---------------------------------------------------------- the block curves
+
+
+def linear_curve(per_unit: float, at_units: int = 100) -> tuple[tuple[int, float], ...]:
+    """A single-point curve with no reuse and no drag: cost is exactly linear.
+
+    This is the honest placeholder. It asserts nothing about how a block's cost
+    scales, which is the one thing calibration exists to find out.
+    """
+    return ((at_units, per_unit * at_units),)
+
+
+def _interpolate(curve: tuple[tuple[int, float], ...], units: float) -> float:
+    """Read a measured curve at `units`, linear between points.
+
+    Below the first measured point the curve is scaled from the origin: a block
+    smaller than anything measured is priced pro rata rather than extrapolated
+    backwards off a segment slope, which could go negative. Above the last point
+    the final segment's slope continues, which prices a plan outside the
+    measured range -- keep the calibration's largest block at or above the
+    largest scenario.
+    """
+    if units <= 0:
+        return 0.0
+    if not curve:
+        raise ValueError("empty block curve")
+    pts = tuple(sorted(curve))
+    u0, v0 = pts[0]
+    if units <= u0:
+        return v0 * units / u0
+    for (ua, va), (ub, vb) in zip(pts, pts[1:]):
+        if units <= ub:
+            return va + (vb - va) * (units - ua) / (ub - ua)
+    if len(pts) == 1:
+        return v0 * units / u0
+    (ua, va), (ub, vb) = pts[-2], pts[-1]
+    return vb + (vb - va) * (units - ub) / (ub - ua)
 
 
 # ---------------------------------------------------------------- cost model
@@ -60,28 +208,186 @@ class CostModel:
     Section 6 reports implied beta in exactly these units.
     """
 
-    # per unit of node size
-    minutes_per_unit: float = 1.0
-    dollars_per_unit: float = 0.10
+    # Block curves: (cumulative size units in one block) -> value. These carry
+    # the whole size-dependence of the model. A single agent working a block
+    # gains from context REUSE (later subtasks need less setup) and loses to
+    # context DRAG (the whole conversation re-billed every turn) -- two opposing
+    # forces on one axis, and which wins is an empirical fact, not a parameter.
+    block_dollars_curve: tuple = MeasuredCurve(
+        ((100, 10.0),),
+        status="placeholder",
+        how=(
+            "Serial calibration run, spawning disabled. Segment the proxy call log at each "
+            "subtask completion; plot cumulative billed dollars against cumulative size units. "
+            "Average >=3 node orderings x 2 repeats and report the spread -- disagreement "
+            "falsifies the units-not-identity assumption. Coverage must reach the largest total "
+            "scenario size or the all-inline plan is priced by extrapolation. Pin the 1-hour "
+            "cache TTL first: at the 5-minute default, prefix entries expire during the gaps "
+            "while tests run, reads silently become writes at 1.25x, and the curve bends "
+            "superlinear for a reason unrelated to context."
+        ),
+        sensitivity=(
+            "CRITICAL. Its shape decides whether spawning can ever be CHEAPER rather than "
+            "merely faster. The linear placeholder asserts neither reuse nor drag, so under it "
+            "the beta=0 oracle says 'spawn nothing' everywhere -- placeholder, not result."
+        ),
+    )
+    block_minutes_curve: tuple = MeasuredCurve(
+        ((100, 100.0),),
+        status="placeholder",
+        how=(
+            "Same segmentation, summing analytic per-call minutes from the fitted timing model "
+            "rather than wall clock, which is confounded by rate limits and provider load."
+        ),
+        sensitivity="CRITICAL. The latency half; sets where fan-out stops paying.",
+    )
 
     # the lead's own overhead
-    explore_minutes: float = 1.0
-    explore_dollars: float = 0.05
+    explore_minutes: float = Measured(
+        1.0,
+        status="placeholder",
+        how="Analytic minutes from run start to the first write_file or spawn_subagent call.",
+        sensitivity="NONE for plan selection: identical in every plan, so it cancels. Verified by inflating\n            it 100x -- every plan shifted by exactly the same amount, no winner changed.",
+    )
+    explore_dollars: float = Measured(
+        0.05,
+        status="placeholder",
+        how="Tokens billed from run start to the first write_file or spawn_subagent call.",
+        sensitivity="NONE for plan selection, same reason. Do not spend measurement effort here.",
+    )
+
 
     # spawn overhead, decomposed per section 5.1: fixed + briefing + absorption
-    spawn_fixed_dollars: float = 0.02
-    brief_minutes: float = 0.5
-    brief_dollars_per_node: float = 0.01
-    absorb_minutes: float = 0.5
-    absorb_dollars_per_node: float = 0.01
+    spawn_fixed_dollars: float = Measured(
+        0.02,
+        status="placeholder",
+        how="Spawn a subagent with a trivial instruction ('read this file, report its line\n            count'). Its total minus the negligible work is the floor: system prompt, tool\n            definitions, one round trip.",
+        sensitivity="HIGH. With briefing and absorption this IS the price of delegating.",
+    )
+    # Briefing and absorption are AFFINE in block size on BOTH axes: a fixed part
+    # per subagent plus a part that scales with how many nodes the instruction
+    # covers. That shape is not a choice -- it is what the fitted timing model
+    # (`minutes = a + b*input_tokens + output_tokens/throughput`) says, since a
+    # briefing's tokens grow with the nodes it describes. Pricing the dollars per
+    # node while charging the minutes flat billed the SAME EMITTED TOKENS two
+    # different ways, and the flat form under-charged wide blocks -- which made
+    # bundling several nodes into one subagent look faster than it is.
+    brief_minutes: float = Measured(
+        0.25,
+        status="placeholder",
+        how="The fixed half: intercept of briefing duration against instruction length, from the\n            fitted timing model. Measure with `brief_minutes_per_node` in one regression, not\n            separately -- they are the intercept and slope of one line.",
+        sensitivity="HIGH, and structurally so: briefings serialise on the lead, so this constant and its\n            per-node partner set the width at which fan-out stops buying time.",
+    )
+    brief_minutes_per_node: float = Measured(
+        0.25,
+        status="placeholder",
+        how="The slope: extra briefing duration per node the instruction covers. Same regression\n            as `brief_minutes`, and the same trace rows as `brief_dollars_per_node` -- one\n            quantity of emitted tokens read in minutes rather than dollars.",
+        sensitivity="HIGH. It is what stops a subagent holding five nodes from being briefed as fast as\n            one holding a single node. Setting it to 0 restores the flat form, which\n            under-charges wide blocks and flatters bundling.",
+    )
+    brief_dollars_per_node: float = Measured(
+        0.01,
+        status="placeholder",
+        how="No inference needed. The instruction text in a spawn_subagent call IS output tokens\n            the lead emitted; read the argument length off the trace.",
+        sensitivity="HIGH. Scales with block size, so it prices wide fan-out specifically.",
+    )
+    absorb_minutes: float = Measured(
+        0.25,
+        status="placeholder",
+        how="The fixed half, same boundary and same regression shape as briefing.",
+        sensitivity="HIGH. Absorptions serialise and queue at the end of a wide fan-out.",
+    )
+    absorb_minutes_per_node: float = Measured(
+        0.25,
+        status="placeholder",
+        how="The slope: extra absorption duration per node in the returning block. Paired with\n            `absorb_dollars_per_node` -- the same returned summary, in minutes.",
+        sensitivity="HIGH. A block of five nodes returns a longer summary than a block of one, and the\n            lead reads them one at a time.",
+    )
+    absorb_dollars_per_node: float = Measured(
+        0.01,
+        status="placeholder",
+        how="Watch the lead's input-token count per turn during a fan-out run; it steps up when a\n            result lands. Multiply that step by the lead turns remaining.",
+        sensitivity="HIGH -- and the flat per-node form UNDER-MODELS the real cost, because a returned\n            summary is re-billed on every subsequent lead turn. The error flatters fan-out.",
+    )
 
-    # context reuse within one block: nodes after the first are discounted.
-    # Placeholder for the fitted delta curve (Stage 5) -- which is parameterized
-    # on block CONTEXT SIZE, not node count, so this scalar is a stand-in only.
-    delta: float = 0.8
 
-    concurrency_cap: int = 4
-    beta: float = 0.0  # dollars per minute; 0 = the "background" persona
+    # Per-stream slowdown when k subagents share one account's rate limits. The
+    # design has carried this as a KNOWN GAP: a single throughput figure
+    # overstates fan-out's latency advantage, the same directional bias as
+    # pricing spawns at zero latency, and it bites hardest exactly where the
+    # headline finding lives.
+    #
+    # Carried as a curve keyed on IN-FLIGHT COUNT, read the same way the block
+    # curves are read: (concurrency, multiplier on a block's duration). The
+    # placeholder is flat 1.0 at every measured point, which asserts no
+    # degradation -- the honest stand-in, and the one that keeps the current
+    # numbers unchanged until the measurement exists.
+    throughput_curve: tuple = MeasuredCurve(
+        ((1, 1.0), (4, 1.0), (8, 1.0)),
+        status="placeholder",
+        how=(
+            "Run the same block at concurrency 1, 4, and 8 and divide each duration by the "
+            "concurrency-1 duration. Measure on ONE account, since the shared quota is the "
+            "mechanism. Report the multiplier, not the raw duration, so it composes with a "
+            "block curve measured separately."
+        ),
+        sensitivity=(
+            "HIGH on wide shapes and none on chains. Flat 1.0 asserts that four subagents "
+            "each run as fast as one would alone, which is the direction that flatters "
+            "fan-out -- so the placeholder biases toward the hypothesis under test."
+        ),
+    )
+
+    concurrency_cap: int = MeasuredInt(
+        4,
+        status="pinned",
+        how="NOT MEASURED. A published harness constant; must equal harness.tools.MAX_CONCURRENCY.",
+        sensitivity=(
+            "An oracle with more workers than the agent can use penalises the agent for a "
+            "constraint it never faced."
+        ),
+    )
+    beta: float = Measured(
+        0.0,
+        status="stated",
+        how="NOT MEASURED. The persona under test: background is 0, attended is anchored to "
+        "blocked developer time.",
+        sensitivity="It IS the question, not an input to be estimated.",
+    )
+
+    @property
+    def is_calibrated(self) -> bool:
+        """True only when no constant is still a guess."""
+        return not unmeasured(self)
+
+    def calibrate(self, source: str, **values) -> "CostModel":
+        """Return a copy with the named constants replaced and marked measured.
+
+        `source` records the run and the price sheet's as-of date. An undated
+        dollar is not a unit, and this is what stops one being printed as though
+        it were. Constants not named here keep their placeholder status, so a
+        partially calibrated model reports itself as exactly that.
+        """
+        import dataclasses
+
+        known = {f.name for f in dataclasses.fields(self)}
+        patched = {}
+        for name, value in values.items():
+            if name not in known:
+                raise ValueError(
+                    f"{name!r} is not a field of CostModel; known constants are "
+                    + ", ".join(sorted(known))
+                )
+            old = getattr(self, name)
+            if not isinstance(old, _PROVENANCED):
+                raise ValueError(
+                    f"{name!r} carries no provenance, so calibrating it would record a "
+                    "measurement against a value of unknown origin"
+                )
+            cls = type(old)
+            patched[name] = cls(
+                value, status="measured", how=old.how, sensitivity=old.sensitivity, source=source
+            )
+        return dataclasses.replace(self, **patched)
 
 
 # --------------------------------------------------------------- plan space
@@ -109,6 +415,18 @@ def _set_partitions(items: list[str]):
         for i in range(len(sub)):
             yield sub[:i] + [[first] + sub[i]] + sub[i + 1 :]
         yield [[first]] + sub
+
+
+def is_feasible(dag: DAG, plan: Plan) -> bool:
+    """Public name for the feasibility rule. See `_is_feasible`.
+
+    Exposed because callers outside the enumerator now construct plans -- the
+    calibration driver builds a bundled fan-out, and a plan that induces a
+    circular wait would be rejected by `enumerate_plans` but accepted by a
+    hand-built one. A rule the enumerator enforces and nobody else can check is
+    a rule with a hole in it.
+    """
+    return _is_feasible(dag, plan)
 
 
 def _is_feasible(dag: DAG, plan: Plan) -> bool:
@@ -181,19 +499,45 @@ class PlanResult:
         return self.cost + beta * self.latency
 
 
-def _block_minutes(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
+def _units(dag: DAG, block: frozenset[str]) -> int:
+    return sum(dag.by_id[v].size for v in block)
+
+
+def throughput_penalty(cm: CostModel, in_flight: int) -> float:
+    """Duration multiplier for a subagent running alongside `in_flight - 1` others.
+
+    Read off `throughput_curve`. Below the first measured point it is 1.0 rather
+    than interpolated from the origin -- a block running alone cannot be faster
+    than the concurrency-1 measurement, and `_interpolate` scales pro rata below
+    its first point, which here would report a multiplier near zero.
+    """
+    if in_flight <= 1:
+        return 1.0
+    pts = tuple(sorted(cm.throughput_curve))
+    if in_flight <= pts[0][0]:
+        return pts[0][1]
+    return _interpolate(cm.throughput_curve, in_flight)
+
+
+def block_minutes(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
     """One agent runs its nodes one at a time, regardless of dependencies."""
-    return sum(dag.by_id[v].size for v in block) * cm.minutes_per_unit
+    return _interpolate(cm.block_minutes_curve, _units(dag, block))
 
 
-def _block_dollars(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
-    """First node pays full freight; later nodes reuse the accumulated context."""
-    order = [v for v in dag.topo_order if v in block]
-    total = 0.0
-    for i, v in enumerate(order):
-        c = dag.by_id[v].size * cm.dollars_per_unit
-        total += c if i == 0 else c * cm.delta
-    return total
+def block_dollars(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
+    """What one agent is billed for working this block in a single context.
+
+    Read straight off the measured curve, keyed on total size units. WHICH nodes
+    they are does not enter: the modelling assumption is that block cost depends
+    on how much work is in the block, not on which subtasks compose it. That is
+    one testable approximation in place of two unmeasurable parameters, and it
+    is checked by calibrating a second node ordering and comparing the curves.
+    """
+    return _interpolate(cm.block_dollars_curve, _units(dag, block))
+
+
+_block_minutes = block_minutes
+_block_dollars = block_dollars
 
 
 def _simulate(dag: DAG, plan: Plan, cm: CostModel, order: tuple[int, ...]) -> float:
@@ -213,6 +557,7 @@ def _simulate(dag: DAG, plan: Plan, cm: CostModel, order: tuple[int, ...]) -> fl
     sub_finish: dict[int, float] = {}
     absorbed: set[int] = set()
     inline_done: set[str] = set()
+    inline_units = 0  # size units the lead has already worked through itself
     lead = cm.explore_minutes
 
     def preds_ready(nodes) -> float | None:
@@ -268,19 +613,41 @@ def _simulate(dag: DAG, plan: Plan, cm: CostModel, order: tuple[int, ...]) -> fl
 
         if kind == "brief":
             b = key
-            lead = start + cm.brief_minutes
+            lead = start + cm.brief_minutes + cm.brief_minutes_per_node * len(plan.blocks[b])
             launched[b] = lead
-            sub_finish[b] = lead + _block_minutes(dag, plan.blocks[b], cm)
+            # How many others are already running when this one starts. The
+            # penalty is applied at LAUNCH rather than recomputed as the mix
+            # changes: a subagent that starts into a crowded account is slowed
+            # for its whole errand, and re-deriving the multiplier mid-flight
+            # would model a scheduler that reallocates quota, which no provider
+            # offers.
+            concurrent = 1 + sum(
+                1 for i, f in sub_finish.items() if launched[i] <= lead < f
+            )
+            sub_finish[b] = lead + _block_minutes(dag, plan.blocks[b], cm) * throughput_penalty(
+                cm, concurrent
+            )
             unbriefed.discard(b)
         elif kind == "absorb":
             b = key
-            lead = start + cm.absorb_minutes
+            lead = start + cm.absorb_minutes + cm.absorb_minutes_per_node * len(plan.blocks[b])
             for v in plan.blocks[b]:
                 avail[v] = lead
             absorbed.add(b)
         else:
             v = key
-            lead = start + dag.by_id[v].size * cm.minutes_per_unit
+            # The lead's inline nodes share ONE context, so they are a block like
+            # any other -- but the lead executes them individually, interleaved
+            # with briefings and absorptions, so each needs its own duration.
+            # Take the MARGINAL value: what adding this node costs on top of the
+            # inline work already done. Summed over the block this telescopes to
+            # exactly block_minutes(inline), so latency and cost stay consistent.
+            before = inline_units
+            inline_units += dag.by_id[v].size
+            lead = start + (
+                _interpolate(cm.block_minutes_curve, inline_units)
+                - _interpolate(cm.block_minutes_curve, before)
+            )
             avail[v] = lead
             inline_done.add(v)
 
@@ -320,7 +687,7 @@ def pareto_front(results: list[PlanResult]) -> list[PlanResult]:
     return out
 
 
-def is_tier_a(results: list[PlanResult], tol: float = 1e-9) -> bool:
+def is_tier_a(results: list[PlanResult], tol: float = OUTCOME_TOL) -> bool:
     """Tier A: one (cost, latency) OUTCOME dominates everything, so the same plan
     is optimal at every persona (section 5.1).
 
@@ -379,9 +746,42 @@ def optimal_k_intervals(results: list[PlanResult]) -> list[tuple[float, float, i
         # Any interior point identifies the interval's argmin; the boundaries are
         # ties by construction. On the unbounded tail, lo + 1 is interior.
         probe = lo + 1.0 if hi == math.inf else (lo + hi) / 2
-        k = min(lines, key=lambda L: L[0] + probe * L[1])[2]
+        # Ties are rampant and must not be broken by enumeration order. Swapping
+        # two interchangeable nodes between two subagents yields a different plan
+        # with an identical outcome, and on wide shapes dozens of plans reach the
+        # same optimum at several DIFFERENT spawn counts -- so a bare min() picks
+        # whichever the enumerator happened to emit first, and the reported k
+        # oscillates with beta instead of climbing.
+        #
+        # Break ties toward the SMALLEST k. At equal cost and equal latency fewer
+        # subagents is strictly preferable -- less failure surface, fewer moving
+        # parts -- and for the implied-beta estimator it is the conservative
+        # choice: reporting the largest tied k would let an over-spawning agent
+        # look rationalizable across more of the beta axis, which biases the
+        # estimator toward the finding this project is trying to test.
+        scored = [(L[0] + probe * L[1], L[2]) for L in lines]
+        floor = min(s for s, _ in scored)
+        k = min(kk for s, kk in scored if s <= floor + OUTCOME_TOL)
         if out and out[-1][2] == k:
             out[-1] = (out[-1][0], hi, k)
         else:
             out.append((lo, hi, k))
     return out
+
+
+# ------------------------------------------------- the two degenerate policies
+#
+# Section 6 reports both as reference lines on every headline figure, and their
+# spread is regret's denominator. They are ordinary members of the enumerated
+# plan set -- no execution required to price them, which is why the denominator
+# costs no API runs.
+
+
+def all_inline(dag: DAG) -> Plan:
+    """Do everything yourself. The COST test's baseline."""
+    return Plan(frozenset(dag.ids), ())
+
+
+def max_fanout(dag: DAG) -> Plan:
+    """One subagent per node. Never cheaper; sometimes faster."""
+    return Plan(frozenset(), tuple(frozenset({v}) for v in dag.ids))

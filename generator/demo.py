@@ -85,14 +85,16 @@ def section_2_oracle(dags: dict[str, DAG], priced: dict[str, list]) -> None:
                 f"${best.cost:5.2f}   {best.latency:4.1f} min   {_fmt_plan(best.plan)}"
             )
         print()
-    print("  Note the background column: serial wins on every shape, and under this")
-    print("  cost model it always will. Spawning adds cost with no offsetting saving")
-    print("  when latency is free, and context reuse makes one big block the cheapest")
-    print("  arrangement by construction. The mechanism that should break that tie --")
-    print("  context drag, where a long serial context gets re-billed every turn until")
-    print("  fanning out is cheaper AND faster -- is specified but not yet implemented.")
-    print("  Until it is, treat 'serial is cheapest' as an artifact of the model, not")
-    print("  a result about agents.")
+    print("  Note the background column: serial wins on every shape, and under the")
+    print("  DEFAULT curve it always will. That is the placeholder speaking, not a")
+    print("  result. Block cost is read off a measured curve, and the default one is")
+    print("  exactly linear -- the only shape asserting neither context reuse (a")
+    print("  block\'s later subtasks needing less setup) nor context drag (the whole")
+    print("  conversation re-billed every turn). Under a linear curve spawning adds")
+    print("  overhead and removes none, so cost rises monotonically with k and beta=0")
+    print("  says \'spawn nothing\' everywhere. A calibrated curve can bend either way,")
+    print("  and which way it bends is what decides whether spawning is ever genuinely")
+    print("  cheaper rather than merely faster. Nobody chooses that here; it is measured.")
 
 
 def section_3_implied_beta(dags: dict[str, DAG], priced: dict[str, list]) -> None:
@@ -189,6 +191,17 @@ def section_5_scale() -> None:
 
 
 def main() -> None:
+    from .oracle import provenance, unmeasured
+
+    cm0 = CostModel()
+    if not cm0.is_calibrated:
+        names = unmeasured(cm0)
+        print()
+        print("  !! UNCALIBRATED. " + str(len(names)) + " of " + str(len(provenance(cm0))) +
+              " cost constants are placeholders.")
+        print("     Shapes below are real; dollar and minute figures are not measurements.")
+        print("     Worst affected: block_dollars_curve, block_minutes_curve (linear stand-ins,")
+        print("     so spawning can never come out cheaper -- that is the placeholder, not a result).")
     print("\n  DELEGATION REGRET -- what the machinery does today")
     print("  " + "-" * 50)
     print("  Cost constants are PLACEHOLDERS pending calibration.")
@@ -205,8 +218,8 @@ def main() -> None:
     section_5_scale()
 
     print(f"\n{'=' * 74}")
-    print("  Next: executable subtask templates with deterministic verifiers,")
-    print("  cost calibration against real API runs, then the reference harness.")
+    print("  Next: the reference harness that runs a model against a scenario,")
+    print("  cost calibration against real API runs, then the scoring module.")
     print(f"{'=' * 74}\n")
 
 
