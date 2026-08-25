@@ -58,10 +58,58 @@ class Turn:
 
 # ------------------------------------------------------------- validation
 
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _check_cache_control(block: dict, where: str) -> None:
+    cc = block.get("cache_control")
+    if cc is None:
+        return
+    if cc.get("type") != "ephemeral":
+        raise ProtocolError(
+            f"anthropic: cache_control in {where} has type {cc.get('type')!r}"
+        )
+    ttl = cc.get("ttl", "5m")
+    if ttl not in ("5m", "1h"):
+        raise ProtocolError(f"anthropic: cache_control ttl {ttl!r} is not a real TTL")
+
 
 def _validate_anthropic(payload: dict) -> str:
-    if not isinstance(payload.get("system"), str) or not payload["system"]:
+    model = str(payload.get("model") or "")
+    system = payload.get("system")
+    if isinstance(system, list):
+        if not system or not all(
+            isinstance(b, dict) and b.get("type") == "text" and b.get("text") for b in system
+        ):
+            raise ProtocolError("anthropic: system blocks must be non-empty text blocks")
+        for block in system:
+            _check_cache_control(block, "system")
+    elif not isinstance(system, str) or not system:
         raise ProtocolError("anthropic: system prompt missing")
+
+    # The parameter 400s a real current-generation endpoint would raise. The
+    # model-family checks matter most: the plumbing model (haiku) predates both
+    # knobs, and sending it the matrix models' spec is exactly the mistake a
+    # preflight would otherwise discover with real dollars.
+    thinking = payload.get("thinking")
+    if thinking is not None:
+        if "budget_tokens" in thinking or thinking.get("type") == "enabled":
+            raise ProtocolError(
+                "anthropic: budget_tokens thinking is removed on current models"
+            )
+        if thinking.get("type") != "adaptive":
+            raise ProtocolError(
+                f"anthropic: unknown thinking type {thinking.get('type')!r}"
+            )
+        if "haiku" in model:
+            raise ProtocolError(f"anthropic: {model} predates adaptive thinking")
+    effort = (payload.get("output_config") or {}).get("effort")
+    if effort is not None:
+        if effort not in _EFFORT_LEVELS:
+            raise ProtocolError(f"anthropic: unknown effort {effort!r}")
+        if "haiku" in model:
+            raise ProtocolError(f"anthropic: {model} predates the effort parameter")
+
     if not payload.get("tools"):
         raise ProtocolError("anthropic: no tools offered")
     for tool in payload["tools"]:
@@ -87,6 +135,14 @@ def _validate_anthropic(payload: dict) -> str:
             continue
         if not isinstance(content, list) or not content:
             raise ProtocolError(f"anthropic: message {i} has empty content")
+        for block in content:
+            if isinstance(block, dict):
+                _check_cache_control(block, f"message {i}")
+        if role == "user":
+            # A block-form opener (the cache-marked first request) still has to
+            # key the script, so its text counts as the first user message.
+            text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+            first_user = first_user or text
 
         if role == "assistant":
             if pending:

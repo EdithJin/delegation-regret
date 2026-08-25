@@ -123,15 +123,57 @@ def _post(url: str, payload: dict, headers: dict, timeout: float) -> tuple[dict,
 # ------------------------------------------------------------------ Anthropic
 
 
+def _tail_breakpoint(messages: list, marker: dict) -> list:
+    """Copies of `messages` with `cache_control` on the final message's last block.
+
+    Copies, never mutates: the marker belongs to THIS request. Persisted into
+    history it would pile up one breakpoint per turn and hit the API's
+    four-per-request cap within a few turns. Moving the single tail marker
+    forward each turn is the documented incremental pattern -- reads match the
+    longest previously cached prefix, so last turn's write is still read.
+    """
+    last = dict(messages[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [{"type": "text", "text": content, "cache_control": marker}]
+    elif isinstance(content, list) and content:
+        blocks = list(content)
+        blocks[-1] = {**blocks[-1], "cache_control": marker}
+        last["content"] = blocks
+    return messages[:-1] + [last]
+
+
 @dataclass
 class AnthropicClient(Client):
-    """Anthropic Messages API. Point `base_url` at the logging proxy."""
+    """Anthropic Messages API. Point `base_url` at the logging proxy.
+
+    The three optional fields after `timeout` are the pinned harness spec
+    (TASKS-AND-OPEN-ISSUES section 2, Aug 24), threaded through
+    `cli.HARNESS_SPEC` so each model's values live in one greppable place:
+
+    * `thinking` -- {"type": "adaptive"} on the matrix models. The current
+      generation accepts no other on-mode (budget_tokens is a 400 now), and
+      claude-haiku-4-5, the plumbing model, accepts none at all, so it stays
+      None there.
+    * `effort` -- "high" on the matrix models. It is the API default, pinned
+      explicitly because a silently inherited default is not a published
+      constant.
+    * `cache_ttl` -- "1h", matching the 2x write premium the price sheets
+      carry. When set, each request holds exactly two cache breakpoints: the
+      system block, and the final message (see `_tail_breakpoint`).
+
+    All three default to None/off, which is the keyless-test configuration:
+    the fake upstream then sees the same requests it always saw.
+    """
 
     model: str
     api_key: str
     base_url: str
     max_tokens: int = 4096
     timeout: float = 300.0
+    thinking: dict | None = None
+    effort: str | None = None
+    cache_ttl: str | None = None
 
     def start(self, system: str, user: str, actor: str = "lead") -> list:
         # The system prompt is a top-level parameter here, not a message, so it
@@ -153,15 +195,24 @@ class AnthropicClient(Client):
 
     def complete(self, history: list, allow: tuple[str, ...]) -> Reply:
         system, messages = self._split(history)
+        system_field: object = system
+        if self.cache_ttl:
+            marker = {"type": "ephemeral", "ttl": self.cache_ttl}
+            system_field = [{"type": "text", "text": system, "cache_control": marker}]
+            messages = _tail_breakpoint(messages, marker)
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "system": system,
+            "system": system_field,
             "messages": messages,
             "tools": [
                 {"name": n, "description": d, "input_schema": s} for n, d, s in _specs(allow)
             ],
         }
+        if self.thinking is not None:
+            payload["thinking"] = self.thinking
+        if self.effort is not None:
+            payload["output_config"] = {"effort": self.effort}
         body, elapsed = _post(
             self.base_url.rstrip("/") + "/v1/messages",
             payload,

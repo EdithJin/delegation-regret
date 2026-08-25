@@ -106,6 +106,107 @@ class TestToolSurfaceOnTheWire(unittest.TestCase):
                 self.assertNotIn("spawn_subagent", names, flavor)
 
 
+class TestPinnedSpecOnTheWire(unittest.TestCase):
+    """The Aug 24 harness-spec pins, checked on the wire.
+
+    Three constants the report publishes -- adaptive thinking, effort, and the
+    one-hour cache TTL -- plus the breakpoint discipline that makes the TTL
+    mean anything: exactly two markers per request, system and conversation
+    tail, with the tail marker moving forward each turn and never persisting
+    into history (persisted markers would hit the four-per-request cap).
+    """
+
+    MARKER = {"type": "ephemeral", "ttl": "1h"}
+
+    def _pinned(self, base_url: str) -> AnthropicClient:
+        return AnthropicClient(model="claude-fake", api_key="k", base_url=base_url,
+                               thinking={"type": "adaptive"}, effort="high",
+                               cache_ttl="1h")
+
+    def test_pinned_params_reach_the_provider(self) -> None:
+        with ProtocolUpstream("anthropic", {"lead": [Turn(text="ok")]}) as up:
+            client = self._pinned(up.base_url)
+            client.complete(client.start("sys", "Read TASKS.md and go", "lead"), ("finish",))
+            sent = up.requests[-1]
+        self.assertEqual(sent["thinking"], {"type": "adaptive"})
+        self.assertEqual(sent["output_config"], {"effort": "high"})
+        self.assertEqual(up.violations, [])
+
+    def test_two_breakpoints_system_and_tail(self) -> None:
+        import json as _json
+
+        with ProtocolUpstream("anthropic", {"lead": [Turn(text="ok")]}) as up:
+            client = self._pinned(up.base_url)
+            client.complete(client.start("sys", "Read TASKS.md and go", "lead"), ("finish",))
+            sent = up.requests[-1]
+        self.assertEqual(sent["system"][0]["cache_control"], self.MARKER)
+        tail = sent["messages"][-1]["content"][-1]
+        self.assertEqual(tail["cache_control"], self.MARKER)
+        self.assertEqual(_json.dumps(sent).count('"cache_control"'), 2)
+
+    def test_the_tail_marker_moves_and_never_persists(self) -> None:
+        import json as _json
+
+        script = {"lead": [Turn(tools=(("read_file", {"path": "pkg/mod_n0.py"}),)),
+                           Turn(text="done")]}
+        with ProtocolUpstream("anthropic", script) as up:
+            client = self._pinned(up.base_url)
+            history = client.start("sys", "Read TASKS.md and go", "lead")
+            reply = client.complete(history, ("read_file", "finish"))
+            client.append_assistant(history, reply)
+            client.append_tool_results(history, [(reply.tool_calls[0], "contents")])
+            client.complete(history, ("read_file", "finish"))
+            second = up.requests[-1]
+        # Still exactly two markers; the tail one now sits on the tool result,
+        # and the opener went back to a plain string -- nothing persisted.
+        self.assertEqual(_json.dumps(second).count('"cache_control"'), 2)
+        self.assertEqual(second["messages"][-1]["content"][-1]["cache_control"], self.MARKER)
+        self.assertIsInstance(second["messages"][0]["content"], str)
+        self.assertEqual(up.violations, [])
+
+    def test_a_plumbing_client_sends_no_pins(self) -> None:
+        # The defaults are the keyless-test configuration: no thinking, no
+        # output_config, string system -- the requests every other test sees.
+        with ProtocolUpstream("anthropic", {"lead": [Turn(text="ok")]}) as up:
+            client = client_for("anthropic", up.base_url)
+            client.complete(client.start("sys", "Read TASKS.md and go", "lead"), ("finish",))
+            sent = up.requests[-1]
+        self.assertNotIn("thinking", sent)
+        self.assertNotIn("output_config", sent)
+        self.assertIsInstance(sent["system"], str)
+
+    def test_the_fake_rejects_the_real_endpoint_400s(self) -> None:
+        from harness.protocol_upstream import _validate_anthropic
+
+        def payload(**over: object) -> dict:
+            base: dict = {
+                "model": "claude-fake",
+                "system": "s",
+                "tools": [{"name": "x", "description": "d", "input_schema": {}}],
+                "messages": [{"role": "user", "content": "go"}],
+            }
+            base.update(over)
+            return base
+
+        with self.assertRaises(ProtocolError):  # budget_tokens is removed
+            _validate_anthropic(payload(thinking={"type": "enabled", "budget_tokens": 2048}))
+        with self.assertRaises(ProtocolError):  # haiku predates adaptive thinking
+            _validate_anthropic(payload(model="claude-haiku-4-5",
+                                        thinking={"type": "adaptive"}))
+        with self.assertRaises(ProtocolError):  # haiku predates effort
+            _validate_anthropic(payload(model="claude-haiku-4-5",
+                                        output_config={"effort": "high"}))
+        with self.assertRaises(ProtocolError):  # a TTL the API does not sell
+            _validate_anthropic(payload(system=[{
+                "type": "text", "text": "s",
+                "cache_control": {"type": "ephemeral", "ttl": "2h"},
+            }]))
+        # And the accepted shape is accepted, so the rejections above are
+        # discriminating rather than reflexive.
+        _validate_anthropic(payload(thinking={"type": "adaptive"},
+                                    output_config={"effort": "high"}))
+
+
 class TestSpawnRoundTripOverTheWire(unittest.TestCase):
     """The question this file exists for: does a subagent's summary get back to
     the lead in a form the provider accepts?"""

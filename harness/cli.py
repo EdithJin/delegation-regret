@@ -72,9 +72,9 @@ ANTHROPIC_API = "https://api.anthropic.com"
 # 2026-08-24. Cache reads are 0.1x input; cache writes carry the 2x premium of
 # the ONE-HOUR TTL, because that is the TTL the harness pins (design doc
 # section 7 -- constants measured under an unpinned TTL do not reproduce).
-# NOTE: the client does not emit `cache_control` yet, so until the pinning task
-# lands these two columns bill zero tokens; they are recorded now so the sheet
-# is complete when the first cached run happens.
+# The cache columns are live: the client breakpoints the system block and the
+# conversation tail at this TTL (HARNESS_SPEC below), and the preflight's
+# `cache_read_input_tokens > 0` check is what proves the writes are being read.
 #
 # claude-sonnet-5 is on introductory pricing through 2026-08-31. The intro
 # sheet is the default because every planned run lands inside the window; the
@@ -104,6 +104,28 @@ PRICE_SHEETS: dict[str, PriceSheet] = {
 }
 
 
+# The pinned harness spec (TASKS-AND-OPEN-ISSUES section 2, Aug 24). These are
+# published constants: every measured run uses exactly these values, and the
+# report reports them. The rest of the spec lives where it is enforced --
+# max_tokens 16000 is the --max-tokens default below (thinking and text share
+# the cap on current models; 4096 truncates mid-tool-call), the concurrency cap
+# is tools.MAX_CONCURRENCY = 4 (pinned by test), and fan-out launches
+# UNSTAGGERED (concurrent spawns forfeiting cache reads is a finding to
+# measure, not an inefficiency to engineer away -- open issue section 4.5).
+#
+# thinking "adaptive" is the only on-mode the current generation accepts, with
+# depth belonging to `effort`; "high" is the API default, pinned explicitly
+# because a silently inherited default is not a published constant.
+# claude-haiku-4-5 is plumbing, never matrix: it predates adaptive thinking
+# and the effort parameter and rejects both with a 400, so its spec sends
+# neither -- the fake upstream enforces the same rejection offline.
+HARNESS_SPEC: dict[str, dict] = {
+    "claude-opus-5": {"thinking": {"type": "adaptive"}, "effort": "high", "cache_ttl": "1h"},
+    "claude-sonnet-5": {"thinking": {"type": "adaptive"}, "effort": "high", "cache_ttl": "1h"},
+    "claude-haiku-4-5": {"thinking": None, "effort": None, "cache_ttl": "1h"},
+}
+
+
 def price_sheet(key: str) -> PriceSheet:
     try:
         return PRICE_SHEETS[key]
@@ -125,12 +147,16 @@ def build_client(args, price: PriceSheet) -> AnthropicClient:
             "real endpoint; for a keyless dry run, point --base-url at a "
             "ProtocolUpstream the way tests/test_cli.py does."
         )
+    spec = HARNESS_SPEC[price.model]
     return AnthropicClient(
         model=price.model,
         api_key=key,
         base_url=args.base_url,
         max_tokens=args.max_tokens,
         timeout=args.timeout,
+        thinking=spec["thinking"],
+        effort=spec["effort"],
+        cache_ttl=spec["cache_ttl"],
     )
 
 
@@ -174,6 +200,11 @@ def cmd_models(args) -> int:
         )
     print("\n  claude-sonnet-5 is the introductory sheet, valid through 2026-08-31;")
     print("  claude-sonnet-5@list restates the same model at list rates.")
+    print("\n  harness spec, pinned 2026-08-24 (published constants):")
+    print("    max_tokens 16000 | thinking adaptive | effort high | cache TTL 1h")
+    print("    fan-out unstaggered | concurrency cap 4 (tools.MAX_CONCURRENCY)")
+    print("    claude-haiku-4-5 (plumbing only) predates adaptive thinking and")
+    print("    effort; its spec sends neither.")
     return 0
 
 
