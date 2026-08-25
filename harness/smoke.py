@@ -1,7 +1,7 @@
 """The week-1 smoke tests, as a command rather than a memory of an afternoon.
 
-Design doc: Phase1-DelegationBench-Design.md, the Aug 12 gate. Sprint schedule:
-Sprint-Schedule.md, Aug 9.
+Design doc: Phase1-DelegationBench-Design.md, the week-1 smoke gate. Sprint
+schedule: Sprint-Schedule.md.
 
 Neither test produces a number that appears in the report. Each answers one
 yes/no question whose answer changes what gets built next, and the entire value
@@ -297,7 +297,7 @@ def cmd_native(args: argparse.Namespace) -> int:
         f"median ttfb {sorted(r.ttfb_s for r in records)[len(records) // 2] * 1000:.0f}ms",
     )
 
-    # The Aug 13 gate asserts this per model; surfacing it here is free.
+    # The pre-calibration gate asserts this per model; surfacing it here is free.
     cached = sum(r.cache_read_tokens or 0 for r in records)
     report.add(
         PASS if cached > 0 else WARN,
@@ -340,7 +340,7 @@ def cmd_native(args: argparse.Namespace) -> int:
     return report.verdict(
         on_pass="native leg is viable. Execute the teaser in week 2, per the "
         "front-loaded-cost rule — do not hold it for week 3.",
-        on_fail="drop the native teaser now, on evidence, per the Aug 12 gate.",
+        on_fail="drop the native teaser now, on evidence, per the smoke gate.",
     )
 
 

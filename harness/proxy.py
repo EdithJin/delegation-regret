@@ -14,7 +14,7 @@ block, which is also what the invoice is computed from.
 
 CACHE READS ARE RECORDED SEPARATELY. A cached input token is billed at a
 fraction of a fresh one, so a run whose cache silently stopped working is not a
-slightly noisy measurement -- it is a different price vector. Section 12's Aug 13
+slightly noisy measurement -- it is a different price vector. The pre-calibration
 gate asserts `cache_read_input_tokens > 0` on every matrix model for exactly
 this reason, and that assertion needs this field to exist.
 

@@ -5,3 +5,9 @@ venv/
 .DS_Store
 .pytest_cache/
 .ipynb_checkpoints/
+
+# Full run traces stay out of history; the published copy ships only a small
+# curated sample (TASKS section 2, Fri), force-added under results/sample/.
+results/
+!results/sample/
+!results/sample/**

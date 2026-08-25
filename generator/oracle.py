@@ -33,7 +33,7 @@ subagent dependency therefore costs an absorption AND a briefing on the lead's
 serial timeline. That is not an extra assumption -- it is what "delegation depth
 is fixed at one level" (section 7) means once you write down the schedule.
 
-Cost constants here are PLACEHOLDERS pending the Aug 13 calibration run. Nothing
+Cost constants here are PLACEHOLDERS pending calibration. Nothing
 in this module hard-codes them; they all live in CostModel.
 """
 
