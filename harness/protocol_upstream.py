@@ -60,6 +60,12 @@ class Turn:
 
 _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
+# The values this fake accepts for chat-completions reasoning_effort. Kept a
+# little permissive on purpose (the harness only ever pins "high"); the exact
+# roster a real gpt-5.6 endpoint accepts is a preflight item, not a constant
+# this offline fake can certify.
+_OPENAI_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
 
 def _check_cache_control(block: dict, where: str) -> None:
     cc = block.get("cache_control")
@@ -174,6 +180,21 @@ def _validate_openai(payload: dict) -> str:
         if tool.get("type") != "function" or "function" not in tool:
             raise ProtocolError("openai: malformed tool spec")
 
+    # The parameter 400s a real chat-completions endpoint would raise.
+    model = str(payload.get("model") or "")
+    if payload.get("stream_options") is not None and not payload.get("stream"):
+        raise ProtocolError("openai: stream_options is only allowed when stream is true")
+    if "max_tokens" in payload and model.startswith("gpt-"):
+        raise ProtocolError(
+            f"openai: {model} rejects legacy max_tokens; send max_completion_tokens"
+        )
+    mct = payload.get("max_completion_tokens")
+    if mct is not None and (not isinstance(mct, int) or isinstance(mct, bool) or mct < 1):
+        raise ProtocolError(f"openai: max_completion_tokens {mct!r} is not a positive integer")
+    effort = payload.get("reasoning_effort")
+    if effort is not None and effort not in _OPENAI_EFFORT_LEVELS:
+        raise ProtocolError(f"openai: unknown reasoning_effort {effort!r}")
+
     first_user = ""
     pending: list[str] = []
     for i, message in enumerate(messages):
@@ -193,9 +214,24 @@ def _validate_openai(payload: dict) -> str:
         if pending:
             raise ProtocolError(f"openai: tool_calls {pending} never answered before a {role}")
         if role == "assistant":
+            for c in message.get("tool_calls") or []:
+                if not c.get("id"):
+                    raise ProtocolError(f"openai: assistant tool_call in message {i} has no id")
+                fn = c.get("function")
+                if fn is not None and "arguments" in fn and not isinstance(fn["arguments"], str):
+                    # The replay trap: arguments leave the endpoint as a JSON
+                    # string, and must return as one. A client that appends its
+                    # PARSED arguments to history passes every single-turn test
+                    # and 400s on its second turn against the real thing.
+                    raise ProtocolError(
+                        f"openai: tool_call arguments in message {i} must be a JSON "
+                        f"string, got {type(fn['arguments']).__name__}"
+                    )
             pending = [c["id"] for c in (message.get("tool_calls") or [])]
     if pending:
         raise ProtocolError(f"openai: conversation ends with unanswered {pending}")
+    if not model:
+        raise ProtocolError("openai: model is required")
     return first_user
 
 
@@ -256,6 +292,92 @@ def _openai_body(turn: Turn, model: str) -> dict:
             "prompt_tokens_details": {"cached_tokens": turn.cache_read_tokens},
         },
     }
+
+
+def _halves(text: str) -> list:
+    """A string in two pieces, so reassembly across deltas is exercised."""
+    mid = (len(text) + 1) // 2
+    return [p for p in (text[:mid], text[mid:]) if p]
+
+
+def _openai_frames(turn: Turn, model: str, include_usage: bool) -> list:
+    """The scripted turn as streaming chunks, shaped the way the real endpoint
+    streams them: a role opener, content fragments, each tool call as a
+    name-bearing opener followed by argument fragments split MID-JSON, a
+    finish_reason chunk, and a usage-only finale -- the finale ONLY when the
+    request asked for stream_options.include_usage, because that is when the
+    real endpoint sends one. A client that forgets the option gets a stream
+    with no usage in it, and its Reply shows zeros a test can catch.
+    """
+    frames: list = [
+        {
+            "id": "chatcmpl-p",
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+    ]
+    for piece in _halves(turn.text):
+        frames.append(
+            {"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+        )
+    for i, (name, arguments) in enumerate(turn.tools):
+        frames.append(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": i,
+                                    "id": f"call_{i}",
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        )
+        for piece in _halves(json.dumps(arguments)):
+            frames.append(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{"index": i, "function": {"arguments": piece}}]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+    frames.append(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls" if turn.tools else "stop",
+                }
+            ]
+        }
+    )
+    if include_usage:
+        frames.append(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": turn.input_tokens + turn.cache_read_tokens,
+                    "completion_tokens": turn.output_tokens,
+                    "prompt_tokens_details": {"cached_tokens": turn.cache_read_tokens},
+                },
+            }
+        )
+    return frames
 
 
 # ------------------------------------------------------------------- server
@@ -371,19 +493,48 @@ class ProtocolUpstream:
                     with upstream._lock:
                         upstream.violations.append(str(exc))
                     return self._send(400, {"error": {"message": str(exc)}})
+                # Prefill scales with the context being read, generation with
+                # what is produced -- kept separate so the streamed path can
+                # put them where a real endpoint does: prefill before the first
+                # byte, generation spread across the chunks.
+                prefill = (
+                    upstream.base_latency_s
+                    + upstream.seconds_per_input_token * turn.input_tokens
+                )
+                generation = upstream.seconds_per_output_token * turn.output_tokens
+                if upstream.flavor == "openai" and payload.get("stream"):
+                    include_usage = bool(
+                        (payload.get("stream_options") or {}).get("include_usage")
+                    )
+                    frames = _openai_frames(turn, upstream.model, include_usage)
+                    return self._send_sse(frames, prefill, generation)
                 body = (
                     _anthropic_body(turn, upstream.model)
                     if upstream.flavor == "anthropic"
                     else _openai_body(turn, upstream.model)
                 )
-                delay = (
-                    upstream.base_latency_s
-                    + upstream.seconds_per_output_token * turn.output_tokens
-                    + upstream.seconds_per_input_token * turn.input_tokens
-                )
-                if delay:
-                    time.sleep(delay)
+                if prefill + generation:
+                    time.sleep(prefill + generation)
                 self._send(200, body)
+
+            def _send_sse(self, frames: list, prefill_s: float, generation_s: float) -> None:
+                if prefill_s:
+                    time.sleep(prefill_s)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                pause = generation_s / max(len(frames), 1)
+                for payload in frames:
+                    if pause:
+                        time.sleep(pause)
+                    frame = f"data: {json.dumps(payload)}\n\n".encode()
+                    self.wfile.write(b"%X\r\n" % len(frame) + frame + b"\r\n")
+                    self.wfile.flush()
+                done = b"data: [DONE]\n\n"
+                self.wfile.write(b"%X\r\n" % len(done) + done + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
 
             def _send(self, status: int, payload: dict) -> None:
                 body = json.dumps(payload).encode()

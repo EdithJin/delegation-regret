@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__all__ = ["FakeUpstream", "EXPECTED_ANTHROPIC", "EXPECTED_OPENAI"]
+__all__ = ["FakeUpstream", "EXPECTED_ANTHROPIC", "EXPECTED_OPENAI", "EXPECTED_OPENAI_STREAM"]
 
 # What a correct parser must recover. The smoke test asserts against these
 # rather than against "some number appeared".
@@ -33,11 +33,25 @@ EXPECTED_ANTHROPIC = {
     "stop_reason": "tool_use",
 }
 
+# input is 200, not the 800 on the wire: prompt_tokens arrives INCLUSIVE of the
+# 600 cached ones, and the record keeps the exclusive (Anthropic) convention so
+# input and cache reads can bill at their own rates without double counting.
+# cache writes are 0 because OpenAI caching is automatic and unbilled on write.
 EXPECTED_OPENAI = {
-    "input_tokens": 800,
+    "input_tokens": 200,
     "output_tokens": 40,
     "cache_read_tokens": 600,
+    "cache_write_tokens": 0,
     "tools_invoked": ["read_file"],
+    "stop_reason": "tool_calls",
+}
+
+EXPECTED_OPENAI_STREAM = {
+    "input_tokens": 300,  # 1500 on the wire, 1200 of them cached
+    "output_tokens": 48,
+    "cache_read_tokens": 1200,
+    "cache_write_tokens": 0,
+    "tools_invoked": ["write_file"],
     "stop_reason": "tool_calls",
 }
 
@@ -78,6 +92,72 @@ _ANTHROPIC_EVENTS = [
     ("message_stop", {"type": "message_stop"}),
 ]
 
+# The streamed shape of a chat-completions turn: one name-bearing tool-call
+# opener, argument fragments split MID-JSON across chunks (a correct client
+# concatenates before parsing; one that parses per-chunk breaks here), a
+# finish_reason chunk, and -- because the harness always asks for
+# stream_options.include_usage -- a final usage-only chunk after the finish.
+_OPENAI_CHUNKS = [
+    {
+        "id": "chatcmpl-fake",
+        "model": "oss-fake",
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    },
+    {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_s1",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": ""},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+    },
+    {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "function": {"arguments": '{"path": "pkg/mod'}}
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+    },
+    {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "function": {"arguments": '_n0.py", "content": "X = 1\\n"}'}}
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+    },
+    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    {
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 1500,
+            "completion_tokens": 48,
+            "prompt_tokens_details": {"cached_tokens": 1200},
+        },
+    },
+]
+
 _OPENAI_BODY = {
     "id": "chatcmpl-fake",
     "model": "oss-fake",
@@ -109,7 +189,8 @@ _OPENAI_BODY = {
 
 
 class FakeUpstream:
-    """Serves one canned Anthropic stream and one canned OpenAI response."""
+    """Serves one canned Anthropic stream and one canned OpenAI response --
+    streamed when the request asks to stream, a JSON body otherwise."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0, gap_s: float = 0.05) -> None:
         self.gap_s = gap_s
@@ -150,11 +231,26 @@ class FakeUpstream:
 
             def do_POST(self) -> None:  # noqa: N802
                 length = int(self.headers.get("Content-Length") or 0)
-                self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(raw or b"{}")
+                except ValueError:
+                    payload = {}
                 if "chat/completions" in self.path:
-                    self._json(_OPENAI_BODY)
+                    if payload.get("stream"):
+                        frames = [
+                            f"data: {json.dumps(chunk)}\n\n".encode()
+                            for chunk in _OPENAI_CHUNKS
+                        ] + [b"data: [DONE]\n\n"]
+                        self._sse(frames)
+                    else:
+                        self._json(_OPENAI_BODY)
                 else:
-                    self._sse()
+                    frames = [
+                        f"event: {name}\ndata: {json.dumps(chunk)}\n\n".encode()
+                        for name, chunk in _ANTHROPIC_EVENTS
+                    ]
+                    self._sse(frames)
 
             def _json(self, payload: dict) -> None:
                 body = json.dumps(payload).encode()
@@ -165,17 +261,16 @@ class FakeUpstream:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _sse(self) -> None:
+            def _sse(self, frames: list) -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                for name, payload in _ANTHROPIC_EVENTS:
+                for frame in frames:
                     # The pause is the point: it separates first-byte from total,
                     # so a buffering proxy is caught rather than flattered.
                     time.sleep(upstream.gap_s)
-                    frame = f"event: {name}\ndata: {json.dumps(payload)}\n\n".encode()
                     self.wfile.write(b"%X\r\n" % len(frame) + frame + b"\r\n")
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")

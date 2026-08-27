@@ -96,15 +96,38 @@ class CallRecord:
         return self.input_tokens is not None and self.output_tokens is not None
 
 
+def _flavor_for_path(path: str) -> str | None:
+    """Which dialect a request path pins: the OpenAI leg posts to
+    /v1/chat/completions and the Anthropic legs to /v1/messages.
+
+    The path decides, not the payload shape, because the two dialects are not
+    reliably distinguishable from a single frame: some OpenAI-compatible
+    servers emit the final usage-only chunk WITHOUT a `choices` key, and a
+    shape-sniffer reads that as Anthropic-ish and silently drops the one frame
+    that carries the money. None (an unrecognized path) falls back to sniffing
+    by shape, which keeps the sniffer testable on bare payloads.
+    """
+    if "chat/completions" in path:
+        return "openai"
+    if "/messages" in path:
+        return "anthropic"
+    return None
+
+
 class UsageSniffer:
     """Pulls usage, tool calls, and stop reason out of either API's wire format.
 
     Kept separate from the HTTP plumbing so it can be tested against recorded
     payloads without a socket -- which is how the parsing gets verified before
     any real money is spent on a request that might parse wrong.
+
+    `flavor` pins which dialect to read ("anthropic" | "openai"), normally from
+    the request path via `_flavor_for_path`; None keeps the historical
+    sniff-by-shape behaviour.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, flavor: str | None = None) -> None:
+        self.flavor = flavor
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
         self.cache_read_tokens: int | None = None
@@ -130,22 +153,50 @@ class UsageSniffer:
             self.cache_write_tokens = usage["cache_creation_input_tokens"]
 
     def _openai_usage(self, usage: dict) -> None:
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens")
+        if cached is not None:
+            self.cache_read_tokens = cached
         if usage.get("prompt_tokens") is not None:
-            self.input_tokens = usage["prompt_tokens"]
+            # prompt_tokens is INCLUSIVE of cached tokens on this wire format,
+            # where Anthropic's input_tokens is exclusive. The record keeps the
+            # exclusive convention -- `call_dollars` bills input and cache reads
+            # at different rates, `OpenAIClient` subtracts identically, and the
+            # trace/proxy cross-check would disqualify every cache-hitting run
+            # if the two halves disagreed. The fresh count is the difference.
+            self.input_tokens = max(usage["prompt_tokens"] - (cached or 0), 0)
         if usage.get("completion_tokens") is not None:
             self.output_tokens = usage["completion_tokens"]
-        details = usage.get("prompt_tokens_details") or {}
-        if details.get("cached_tokens") is not None:
-            self.cache_read_tokens = details["cached_tokens"]
+        if self.cache_write_tokens is None:
+            # OpenAI prompt caching is automatic and unbilled on write; there is
+            # no write count to miss, so a seen usage block pins the column to
+            # its true billed value rather than leaving it "unreported".
+            self.cache_write_tokens = 0
 
     def _note_tool(self, name: str | None) -> None:
         if name and name not in self.tools_invoked:
             self.tools_invoked.append(name)
 
+    def _openai_event(self, payload: dict) -> None:
+        """One OpenAI streaming chunk. Reads usage whether or not the chunk
+        carries a `choices` key -- the include_usage finale is `"choices": []`
+        from api.openai.com and omits the key on some compatible servers."""
+        self.model = payload.get("model") or self.model
+        if payload.get("usage"):
+            self._openai_usage(payload["usage"])
+        for choice in payload.get("choices") or []:
+            delta = choice.get("delta") or {}
+            for call in delta.get("tool_calls") or []:
+                self._note_tool((call.get("function") or {}).get("name"))
+            if choice.get("finish_reason"):
+                self.stop_reason = choice["finish_reason"]
+
     # -- entry points ----------------------------------------------------
 
     def feed_event(self, payload: dict) -> None:
         """One decoded SSE `data:` payload, from either provider."""
+        if self.flavor == "openai":
+            return self._openai_event(payload)
         kind = payload.get("type")
         if kind == "message_start":
             message = payload.get("message") or {}
@@ -158,16 +209,8 @@ class UsageSniffer:
         elif kind == "message_delta":
             self._anthropic_usage(payload.get("usage") or {})
             self.stop_reason = (payload.get("delta") or {}).get("stop_reason") or self.stop_reason
-        elif "choices" in payload:  # OpenAI streaming chunk
-            self.model = payload.get("model") or self.model
-            if payload.get("usage"):
-                self._openai_usage(payload["usage"])
-            for choice in payload["choices"]:
-                delta = choice.get("delta") or {}
-                for call in delta.get("tool_calls") or []:
-                    self._note_tool((call.get("function") or {}).get("name"))
-                if choice.get("finish_reason"):
-                    self.stop_reason = choice["finish_reason"]
+        elif self.flavor is None and "choices" in payload:  # shape-sniffed OpenAI chunk
+            self._openai_event(payload)
 
     def feed_body(self, body: bytes) -> None:
         """A complete non-streaming response body, from either provider."""
@@ -178,9 +221,9 @@ class UsageSniffer:
         if not isinstance(payload, dict):
             return
         self.model = payload.get("model") or self.model
-        if "choices" in payload:  # OpenAI
+        if self.flavor == "openai" or (self.flavor is None and "choices" in payload):  # OpenAI
             self._openai_usage(payload.get("usage") or {})
-            for choice in payload["choices"]:
+            for choice in payload.get("choices") or []:
                 message = choice.get("message") or {}
                 for call in message.get("tool_calls") or []:
                     self._note_tool((call.get("function") or {}).get("name"))
@@ -337,7 +380,7 @@ class LoggingProxy:
                 request = urllib.request.Request(
                     proxy.upstream + self.path, data=body or None, headers=headers, method=method
                 )
-                sniffer = UsageSniffer()
+                sniffer = UsageSniffer(_flavor_for_path(self.path))
                 record.t_request = time.time()
                 started = time.perf_counter()
                 try:

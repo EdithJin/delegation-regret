@@ -18,11 +18,16 @@ same block independently on the wire, which makes the two a cross-check rather
 than a duplication: if the trace and the proxy log disagree, one of them is
 parsing wrong and the run is not trustworthy.
 
-NON-STREAMING ON PURPOSE. The runner needs total duration and exact usage, both
-of which a single response carries. Streaming would add a real time-to-first-byte
-per call, but the fitted timing model regresses on `total_s`, and the proxy
-already proves the streaming path is unbuffered where that matters. One less
-moving part in the loop that spends money.
+NON-STREAMING ON THE ANTHROPIC LEG, STREAMING ON THE OPENAI ONE -- each on
+purpose. The runner needs total duration and exact usage. On the Anthropic leg a
+single response carries both, the fitted timing model regresses on `total_s`,
+and the proxy already proves the streaming path is unbuffered where that
+matters -- one less moving part in the loop that spends money. The
+chat-completions leg streams instead: with `stream_options.include_usage` the
+final chunk carries the same exact usage a buffered body would, the streaming
+path is the one OpenAI-compatible open-source servers actually exercise, and it
+hands the client a real time-to-first-byte -- where the Anthropic client can
+only report `ttfb_s == total_s` and lean on the proxy for the split.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .tools import TOOL_SPECS
+from .tools import TOOL_SPECS, parse_arguments
 
 __all__ = [
     "ToolRequest",
@@ -118,6 +123,51 @@ def _post(url: str, payload: dict, headers: dict, timeout: float) -> tuple[dict,
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read()
     return json.loads(raw), time.perf_counter() - started
+
+
+def _post_sse(url: str, payload: dict, headers: dict, timeout: float) -> tuple[list[dict], float, float]:
+    """POST expecting an SSE response; (decoded data payloads, ttfb_s, total_s).
+
+    ttfb is stamped at the first response byte off the socket, which is why the
+    read uses `read1` where available: `read(n)` blocks until it has all n bytes,
+    which on a chunked stream means waiting for the generation to finish -- the
+    token counts would stay perfectly correct and ttfb would silently equal the
+    total (the same failure mode `harness.proxy` documents on its relay).
+
+    SSE frames do not respect socket-read boundaries, so lines are cut at
+    newlines with the incomplete tail carried into the next read -- assuming
+    whole lines works on localhost and drops the final usage frame on a slow
+    connection, which is every real run.
+    """
+    body = json.dumps(payload).encode()
+    request = urllib.request.Request(url, data=body, headers=headers)
+    started = time.perf_counter()
+    first: float | None = None
+    events: list[dict] = []
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        pull = getattr(response, "read1", None) or response.read
+        buffer = b""
+        while True:
+            chunk = pull(8192)
+            if not chunk:
+                break
+            if first is None:
+                first = time.perf_counter()
+            buffer += chunk
+            *lines, buffer = buffer.split(b"\n")
+            for line in lines:
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == b"[DONE]":
+                    continue
+                try:
+                    events.append(json.loads(data))
+                except ValueError:
+                    continue
+    total = time.perf_counter() - started
+    return events, (first - started) if first is not None else total, total
 
 
 # ------------------------------------------------------------------ Anthropic
@@ -267,12 +317,30 @@ class AnthropicClient(Client):
 
 @dataclass
 class OpenAIClient(Client):
-    """Any OpenAI-compatible chat-completions endpoint, including local ones."""
+    """Any OpenAI-compatible chat-completions endpoint, including local ones.
+
+    The wire format is `POST /v1/chat/completions` on purpose: it is the one
+    dialect both api.openai.com and the open-source servers (vLLM, llama.cpp,
+    Ollama, ...) speak, so one client covers the whole non-Anthropic column.
+
+    Every request streams with `stream_options: {"include_usage": true}` -- see
+    the module docstring for why this leg streams when the Anthropic one does
+    not. The final chunk then carries the provider's own usage block, which is
+    the only token source this repo accepts.
+
+    `max_tokens` is sent as `max_completion_tokens`: current OpenAI reasoning
+    models reject the legacy `max_tokens` key with a 400. `effort` is sent as
+    `reasoning_effort`, this wire format's analogue of the Anthropic effort
+    pin; None (the keyless-test default) sends neither key, mirroring the
+    plumbing configuration on the Anthropic side.
+    """
 
     model: str
     api_key: str
     base_url: str
+    max_tokens: int = 4096
     timeout: float = 300.0
+    effort: str | None = None
 
     def start(self, system: str, user: str, actor: str = "lead") -> list:
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -281,50 +349,98 @@ class OpenAIClient(Client):
         payload = {
             "model": self.model,
             "messages": history,
+            "max_completion_tokens": self.max_tokens,
             "tools": [
                 {"type": "function", "function": {"name": n, "description": d, "parameters": s}}
                 for n, d, s in _specs(allow)
             ],
             "tool_choice": "auto",
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
+        if self.effort is not None:
+            payload["reasoning_effort"] = self.effort
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        body, elapsed = _post(
+        events, ttfb, total = _post_sse(
             self.base_url.rstrip("/") + "/v1/chat/completions", payload, headers, self.timeout
         )
-        choice = (body.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        usage = body.get("usage") or {}
-        details = usage.get("prompt_tokens_details") or {}
-        cached = int(details.get("cached_tokens") or 0)
+
+        # One assistant turn arrives as many deltas: text in content fragments,
+        # each tool call as a name-bearing opener followed by argument-string
+        # fragments keyed by `index`, and -- because include_usage was requested
+        # -- a final usage-only chunk after the finish_reason.
+        text_parts: list[str] = []
+        slots: dict[int, dict] = {}
+        finish = ""
+        usage: dict = {}
+        for event in events:
+            if event.get("usage"):
+                usage = event["usage"]
+            for choice in event.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    text_parts.append(delta["content"])
+                for c in delta.get("tool_calls") or []:
+                    slot = slots.setdefault(
+                        int(c.get("index") or 0), {"id": "", "name": "", "arguments": ""}
+                    )
+                    if c.get("id"):
+                        slot["id"] = c["id"]
+                    fn = c.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
 
         calls = []
-        for c in message.get("tool_calls") or []:
-            fn = c.get("function") or {}
-            from .tools import parse_arguments
-
+        ordered = [slots[i] for i in sorted(slots)]
+        for slot in ordered:
             try:
-                arguments = parse_arguments(fn.get("arguments"))
+                arguments = parse_arguments(slot["arguments"])
             except ValueError:
                 # Surfaced, not repaired: a model that cannot emit valid JSON
                 # arguments is exactly what the open-weights gate is looking for,
                 # and silently fixing it would hide the finding.
-                arguments = {"__malformed__": str(fn.get("arguments"))[:200]}
-            calls.append(ToolRequest(id=c.get("id", ""), name=fn.get("name", ""), arguments=arguments))
+                arguments = {"__malformed__": slot["arguments"][:200]}
+            calls.append(ToolRequest(id=slot["id"], name=slot["name"], arguments=arguments))
+
+        text = "".join(text_parts)
+        # The assistant message to replay next turn, rebuilt in the shape the
+        # endpoint demands back: `arguments` stays the VERBATIM wire string --
+        # a real endpoint 400s a replayed tool call whose arguments arrive as a
+        # parsed object, and re-serializing our parse would launder a malformed
+        # emission into a valid-looking one.
+        message: dict = {"role": "assistant", "content": text or None}
+        if ordered:
+            message["tool_calls"] = [
+                {"id": s["id"], "type": "function",
+                 "function": {"name": s["name"], "arguments": s["arguments"]}}
+                for s in ordered
+            ]
 
         # OpenAI reports prompt_tokens INCLUSIVE of cached ones; the cost model
         # bills the two at different rates, so the fresh count is the difference.
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0)
         prompt = int(usage.get("prompt_tokens") or 0)
         return Reply(
-            text=message.get("content") or "",
+            text=text,
             tool_calls=tuple(calls),
             input_tokens=max(prompt - cached, 0),
             output_tokens=int(usage.get("completion_tokens") or 0),
             cache_read_tokens=cached,
-            stop_reason=choice.get("finish_reason") or "",
-            total_s=elapsed,
-            ttfb_s=elapsed,
+            # There is no cache-write count to read: OpenAI prompt caching is
+            # automatic, and writing to it is not a billed event with a token
+            # figure. Zero is the true billed quantity for the write column,
+            # not a missing measurement.
+            cache_write_tokens=0,
+            stop_reason=finish,
+            total_s=total,
+            ttfb_s=ttfb,
             raw=message,
         )
 

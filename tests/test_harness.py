@@ -18,7 +18,12 @@ import urllib.request
 from pathlib import Path
 
 from generator.templates import CheckResult
-from harness.fake_upstream import EXPECTED_ANTHROPIC, EXPECTED_OPENAI, FakeUpstream
+from harness.fake_upstream import (
+    EXPECTED_ANTHROPIC,
+    EXPECTED_OPENAI,
+    EXPECTED_OPENAI_STREAM,
+    FakeUpstream,
+)
 from harness.proxy import LoggingProxy, UsageSniffer
 from harness.tools import TOOL_SPECS, Workspace, anthropic_tools, openai_tools, parse_arguments
 
@@ -70,7 +75,13 @@ class TestUsageSniffer(unittest.TestCase):
     def test_openai_body_is_normalized_onto_the_same_fields(self) -> None:
         # The open-weights leg has to land in the same log as the frontier legs
         # or the cross-model table is not comparable in the dimension the report
-        # claims to measure.
+        # claims to measure. "Normalized" includes the counting convention:
+        # OpenAI's prompt_tokens is INCLUSIVE of cached tokens where Anthropic's
+        # input_tokens is exclusive, so the sniffer records the fresh count
+        # (30 - 25 = 5) -- the same subtraction OpenAIClient performs, without
+        # which every cache-hitting run would bill cached tokens twice and fail
+        # the trace/proxy cross-check. Cache writes pin to 0: OpenAI caching is
+        # automatic and unbilled on write, so zero is the truth, not a gap.
         sniffer = UsageSniffer()
         sniffer.feed_body(
             json.dumps(
@@ -89,14 +100,38 @@ class TestUsageSniffer(unittest.TestCase):
                 }
             ).encode()
         )
-        self.assertEqual((sniffer.input_tokens, sniffer.output_tokens), (30, 40))
+        self.assertEqual((sniffer.input_tokens, sniffer.output_tokens), (5, 40))
         self.assertEqual(sniffer.cache_read_tokens, 25)
+        self.assertEqual(sniffer.cache_write_tokens, 0)
         self.assertEqual(sniffer.tools_invoked, ["read_file"])
 
     def test_malformed_payloads_do_not_raise(self) -> None:
         sniffer = UsageSniffer()
         sniffer.feed_body(b"not json at all")
         sniffer.feed_sse_chunk(b"data: {broken\n\n")
+        self.assertIsNone(sniffer.input_tokens)
+
+    def test_a_path_pinned_openai_sniffer_reads_a_usage_only_chunk(self) -> None:
+        # The include_usage finale is `"choices": []` from api.openai.com, and
+        # some compatible servers omit the key entirely. Shape-sniffing reads
+        # that frame as Anthropic-ish and drops the one chunk that carries the
+        # money -- which is why the proxy pins the dialect from the request
+        # path instead of guessing per frame.
+        chunk = {"usage": {"prompt_tokens": 50, "completion_tokens": 9,
+                           "prompt_tokens_details": {"cached_tokens": 20}}}
+        pinned = UsageSniffer("openai")
+        pinned.feed_event(dict(chunk))
+        self.assertEqual((pinned.input_tokens, pinned.output_tokens), (30, 9))
+        self.assertEqual(pinned.cache_read_tokens, 20)
+        unpinned = UsageSniffer()
+        unpinned.feed_event(dict(chunk))
+        self.assertIsNone(unpinned.input_tokens)  # the failure the pin prevents
+
+    def test_a_path_pinned_anthropic_sniffer_ignores_openai_shapes(self) -> None:
+        # The complement: on /v1/messages the path decides too, so a payload
+        # that happens to carry `choices` is not read as the other dialect.
+        sniffer = UsageSniffer("anthropic")
+        sniffer.feed_event({"choices": [], "usage": {"prompt_tokens": 50}})
         self.assertIsNone(sniffer.input_tokens)
 
 
@@ -144,6 +179,28 @@ class TestProxy(unittest.TestCase):
         record = proxy.records[-1]
         for key, value in EXPECTED_OPENAI.items():
             self.assertEqual(getattr(record, key), value, key)
+
+    def test_streaming_openai_call_is_captured_exactly(self) -> None:
+        # The wire shape the OpenAI leg actually runs: chunked SSE with the
+        # usage in a trailing include_usage frame. Same instrument guarantees
+        # as the Anthropic stream -- exact tokens off the final frame, and a
+        # first-byte timestamp that proves the relay did not buffer.
+        with FakeUpstream(gap_s=0.03) as upstream, LoggingProxy(upstream.base_url) as proxy:
+            request = urllib.request.Request(
+                proxy.base_url + "/v1/chat/completions",
+                data=json.dumps(
+                    {"model": "m", "stream": True,
+                     "stream_options": {"include_usage": True}}
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(request, timeout=30).read()
+        record = proxy.records[-1]
+        for key, value in EXPECTED_OPENAI_STREAM.items():
+            self.assertEqual(getattr(record, key), value, key)
+        self.assertTrue(record.billable)
+        self.assertGreater(record.ttfb_s, 0.0)
+        self.assertLess(record.ttfb_s, record.total_s * 0.8)
 
     def test_records_are_written_as_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
