@@ -1,0 +1,151 @@
+{
+  "name": "core-seeds-11-23",
+  "note": "Pre-registered graded set. Equal counts per shape so the pooled figure is an unweighted mean of the four classes. Fixed seeds; do not edit without changing the fingerprint and saying so. Trimmed to seeds [11, 23] per shape*n cell.",
+  "fingerprint": "794c4435b80d",
+  "specs": [
+    {
+      "shape": "wide",
+      "n": 4,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "wide",
+      "n": 4,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "wide",
+      "n": 6,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "wide",
+      "n": 6,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "wide",
+      "n": 8,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "wide",
+      "n": 8,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "chain",
+      "n": 4,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "chain",
+      "n": 4,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "chain",
+      "n": 6,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "chain",
+      "n": 6,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "chain",
+      "n": 8,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "chain",
+      "n": 8,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "diamond",
+      "n": 4,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "diamond",
+      "n": 4,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "diamond",
+      "n": 6,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "diamond",
+      "n": 6,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "diamond",
+      "n": 8,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "diamond",
+      "n": 8,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "mixed",
+      "n": 4,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "mixed",
+      "n": 4,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "mixed",
+      "n": 6,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "mixed",
+      "n": 6,
+      "size": 3,
+      "seed": 23
+    },
+    {
+      "shape": "mixed",
+      "n": 8,
+      "size": 3,
+      "seed": 11
+    },
+    {
+      "shape": "mixed",
+      "n": 8,
+      "size": 3,
+      "seed": 23
+    }
+  ]
+}
