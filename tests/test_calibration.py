@@ -149,11 +149,33 @@ class TestCurveExtraction(unittest.TestCase):
             block_curves([Trace(scenario_id=scn.id, model="m")], scn, PRICE,
                          TimingModel(1.0, 0.0, 1e12))
 
+    def test_misaligned_buckets_average_monotone_not_by_coverage(self) -> None:
+        # Forced orderings put runs on different cumulative-unit grids: a run
+        # that starts with a size-5 node has no point at 3 units. Bucketing by
+        # raw unit count then averages each bucket over whichever runs land on
+        # it, and the first real preflight's mean curve came out NON-MONOTONE
+        # (5 units priced below 3) purely as a coverage artifact. The average
+        # must read every covering run via interpolation and never fall.
+        from harness.calibrate import average_curves
+
+        a = ((3, 0.30), (8, 0.80), (24, 2.40))   # started with the size-3 node
+        b = ((5, 0.05), (8, 0.60), (24, 2.00))   # started with the size-5 node
+        avg = dict(average_curves([a, b]))
+        values = [v for _, v in sorted(avg.items())]
+        self.assertEqual(values, sorted(values), values)
+        # At 5 units run `a` contributes its interpolated measurement, not
+        # nothing -- so run b's cheap draw cannot own the bucket outright.
+        self.assertGreater(avg[5], 0.05)
+        # Aligned buckets stay plain means.
+        self.assertAlmostEqual(avg[8], 0.70)
+
 
 class TestOverheadExtraction(unittest.TestCase):
     def _fanout_trace(self) -> Trace:
-        """A lead that spawns twice -- one 1-node block, one 2-node block -- so
-        the briefing slope is identifiable."""
+        """A lead that spawns three subagents across two turns; the middle one
+        covers TWO nodes (per attribution) with a proportionally longer
+        instruction, so the per-spawn briefing regression sees two distinct
+        block sizes."""
         trace = Trace(scenario_id="s", model="m")
         from harness.trace import SpawnRecord
 
@@ -173,13 +195,22 @@ class TestOverheadExtraction(unittest.TestCase):
             ModelCall(actor=LEAD, index=3, input_tokens=1500, output_tokens=30,
                       tools_invoked=("finish",), t_request=3.0)
         )
+        instructions = {
+            0: "fix module a",
+            1: "fix modules b and c, including their shared edge",  # 2 nodes
+            2: "fix module d",
+        }
         for i in range(3):
             trace.spawns.append(SpawnRecord(index=i, batch=0 if i == 0 else 1,
-                                            instruction=f"do {i}", files=()))
+                                            instruction=instructions[i], files=()))
             trace.calls.append(
                 ModelCall(actor=f"subagent:{i}", index=0, input_tokens=400,
                           output_tokens=60, t_request=4.0 + i)
             )
+        # Who wrote what -- the ground truth the per-spawn x is read from.
+        trace.node_attribution = {
+            "a": "subagent:0", "b": "subagent:1", "c": "subagent:1", "d": "subagent:2",
+        }
         return trace
 
     def test_spawn_fixed_is_the_subagents_first_call(self) -> None:
@@ -202,12 +233,16 @@ class TestOverheadExtraction(unittest.TestCase):
         # The failure mode a fan-out run falls into when every spawn covers
         # exactly one node. Reporting a number here would be fitting a line to a
         # single point, so it is refused with a reason.
+        from harness.trace import SpawnRecord
+
         trace = Trace(scenario_id="s", model="m")
         for i in range(3):
             trace.calls.append(
                 ModelCall(actor=LEAD, index=i, input_tokens=500, output_tokens=100,
                           tools_invoked=("spawn_subagent",), t_request=float(i))
             )
+            trace.spawns.append(SpawnRecord(index=i, batch=i, instruction=f"do {i}", files=()))
+            trace.node_attribution[f"node{i}"] = f"subagent:{i}"
         out = spawn_overhead([trace], PRICE, TimingModel(1.0, 0.0, 1e12))
         self.assertIsNone(out["brief_dollars_per_node"])
         self.assertIn("unidentifiable", out["brief_dollars_why"])
@@ -217,11 +252,46 @@ class TestOverheadExtraction(unittest.TestCase):
         self.assertIsNotNone(out["absorb_dollars_per_node"])
         self.assertGreater(out["absorb_dollars_per_node"], 0.0)
 
-    def test_explore_stops_at_the_first_action(self) -> None:
+    def test_explore_stops_before_the_first_action(self) -> None:
         out = explore_overhead(self._fanout_trace(), PRICE, TimingModel(1.0, 0.0, 1e12))
-        # Calls 0 (list_files) and 1 (the first spawn) inclusive.
-        self.assertEqual(out["n_calls"], 2)
+        # Call 0 (list_files) only. The acting turn's spend belongs to the work
+        # it starts -- counting it here charged the same turn twice, once as
+        # explore and once inside the briefing or the block curve.
+        self.assertEqual(out["n_calls"], 1)
         self.assertGreater(out["explore_dollars"], 0.0)
+
+    def test_sub_block_curve_is_the_subagents_own_bill_minus_its_first_call(self) -> None:
+        # The estimation gate's finding turned into a measurement: a spawned
+        # block is priced by what SUBAGENTS were billed, never by the lead's
+        # warm-context serial curve. First calls are excluded -- they are
+        # spawn_fixed_dollars' measurement, and charging them twice would
+        # rebuild the double-count this curve exists to remove.
+        from harness.calibration import sub_block_curves
+
+        scn = scenario(n=3, size=2)
+        ids = list(scn.dag.ids)
+        trace = Trace(scenario_id=scn.id, model="m")
+        # subagent:0 works one node (2 units): first call + one work call.
+        trace.calls.append(ModelCall(actor="subagent:0", index=0,
+                                     input_tokens=400, output_tokens=60, total_s=1.0))
+        trace.calls.append(ModelCall(actor="subagent:0", index=1,
+                                     input_tokens=1000, output_tokens=100, total_s=1.0))
+        # subagent:1 works two nodes (4 units): first call + two work calls.
+        trace.calls.append(ModelCall(actor="subagent:1", index=0,
+                                     input_tokens=400, output_tokens=60, total_s=1.0))
+        for i in (1, 2):
+            trace.calls.append(ModelCall(actor="subagent:1", index=i,
+                                         input_tokens=1500, output_tokens=120, total_s=1.0))
+        trace.node_attribution = {ids[0]: "subagent:0", ids[1]: "subagent:1",
+                                  ids[2]: "subagent:1"}
+        out = sub_block_curves([trace], scn, PRICE, TimingModel(1.0, 0.0, 1e12))
+        curve = dict(out["sub_block_dollars_curve"])
+        self.assertEqual(sorted(curve), [2, 4])
+        one_work_call = (1000 * 3.0 + 100 * 15.0) / 1e6
+        two_work_calls = 2 * (1500 * 3.0 + 120 * 15.0) / 1e6
+        self.assertAlmostEqual(curve[2], one_work_call, places=9)
+        self.assertAlmostEqual(curve[4], two_work_calls, places=9)
+        self.assertEqual(out["n_subagent_blocks"], 2)
 
     def test_a_lead_that_never_acted_yields_no_explore_constant(self) -> None:
         trace = Trace(scenario_id="s", model="m")
@@ -248,9 +318,15 @@ class TestDriverEndToEnd(unittest.TestCase):
         finish = ("finish", {"summary": "done"})
         blocks = [sorted(b) for b in bundled_plan(scn).blocks]
 
+        # Every lead opens with an orientation turn BEFORE acting: that prefix
+        # is what explore_* measures, and the block curves subtract it -- a
+        # fixture whose lead acts on turn one would leave the prefix path
+        # silently unexercised.
+        orient = Turn(tools=(("list_files", {}),), input_tokens=650, output_tokens=45)
         script = {
             # Serial: one node per turn, context growing, output varying.
             "serial": [
+                orient,
                 *[
                     Turn(tools=(write(n),), input_tokens=700 + 400 * i, output_tokens=60 + 40 * i)
                     for i, n in enumerate(ids)
@@ -259,6 +335,7 @@ class TestDriverEndToEnd(unittest.TestCase):
             ],
             # Fan-out: one brief per node. Output scales with nodes briefed.
             "fanout": [
+                orient,
                 Turn(
                     tools=tuple(
                         ("spawn_subagent", {"instruction": f"repair {n}", "files": []})
@@ -271,6 +348,7 @@ class TestDriverEndToEnd(unittest.TestCase):
             ],
             # Bundled: fewer, larger blocks -> the second x value for the slope.
             "bundled": [
+                orient,
                 Turn(
                     tools=tuple(
                         ("spawn_subagent", {"instruction": "repair " + ",".join(b), "files": []})
@@ -341,6 +419,16 @@ class TestDriverEndToEnd(unittest.TestCase):
         self.assertEqual(saved["price_sheet"]["as_of"], "2026-08-23")
         self.assertEqual(result.skipped, {}, result.skipped)
         self.assertEqual(result.diagnostics["n_serial_runs"], 2)
+        # The estimation gate ran: every executed plan got a composed
+        # prediction compared against its measured total, on both axes.
+        comp = result.diagnostics["composition"]
+        self.assertTrue(comp["checked"], comp)
+        self.assertEqual({a["plan"] for a in comp["arms"]},
+                         {"all-inline", "max-fanout", "bundled"})
+        for arm in comp["arms"]:
+            self.assertIsNotNone(arm["rel_gap_dollars"], arm)
+            self.assertIsNotNone(arm.get("rel_gap_minutes"), arm)
+        self.assertIn(comp["cost_ranking_preserved"], (True, False))
         # Reproducible from the saved traces alone -- that is what makes the
         # calibration checkable rather than merely recorded.
         self.assertEqual(result.constants, again.constants)
@@ -367,18 +455,26 @@ class TestDriverEndToEnd(unittest.TestCase):
                 self.assertGreater(scalar, 0.0, f"{name} came out non-positive")
 
     def test_a_partial_calibration_reports_itself_as_partial(self) -> None:
-        # Constant output length -> no timing model -> the dollar half survives
-        # and the minutes half is reported as skipped, with the reason.
+        # Unfittable timing -> the dollar half survives and the minutes half is
+        # reported as skipped, with the reason. Input is EXACTLY 8x output on
+        # every call, so the design matrix is singular by construction: both
+        # columns vary (the first-trace gate passes, as it should -- it is
+        # necessary, not sufficient) but no jitter in real socket latency can
+        # make collinear regressors identifiable. An earlier version used two
+        # design points and constant output, and whether the fit failed then
+        # depended on the timing noise of the machine running the tests.
         scn = scenario(n=3, size=1)
+        tok = [(800, 100), (1600, 200), (800, 100)]
         flat = {
             "lead": [
                 *[
                     Turn(tools=(("write_file", {"path": module_path(n),
                                                 "content": scn.reference[n]}),),
-                         input_tokens=800, output_tokens=100)
-                    for n in scn.dag.ids
+                         input_tokens=tok[i][0], output_tokens=tok[i][1])
+                    for i, n in enumerate(scn.dag.ids)
                 ],
-                Turn(tools=(("finish", {"summary": "done"}),)),
+                Turn(tools=(("finish", {"summary": "done"}),),
+                     input_tokens=1600, output_tokens=200),
             ]
         }
         with ProtocolUpstream("anthropic", flat) as up:
@@ -390,6 +486,11 @@ class TestDriverEndToEnd(unittest.TestCase):
         self.assertIn("block_minutes_curve", result.skipped)
         self.assertIn("timing model", result.skipped["block_minutes_curve"])
         self.assertFalse(result.to_cost_model().is_calibrated)
+        # A composed prediction from placeholder constants would price plans
+        # with guesses; the estimation gate must refuse, with the reason.
+        comp = result.diagnostics["composition"]
+        self.assertFalse(comp["checked"])
+        self.assertIn("placeholder", comp["why"])
 
     def test_the_report_flags_wide_disagreement_rather_than_burying_it(self) -> None:
         result = CalibrationResult(
@@ -496,6 +597,173 @@ class TestSignGuards(unittest.TestCase):
         self.assertAlmostEqual(out["brief_minutes_per_node"], 0.1)
 
 
+class TestTimingModelSeesContextNotBilledInput(unittest.TestCase):
+    """The regressor is what the model READ, not what was billed as fresh input.
+
+    Under the pinned cache breakpoints nearly the whole prompt bills as cache
+    reads and writes, and billed `input_tokens` collapses to a near-constant
+    residue -- the first real calibration carried input_tokens == 2 on every
+    one of its 109 calls while the context varied by tens of thousands of
+    tokens. The old fit regressed on billed input and was singular; where it
+    did fit (the Haiku preflight), it priced 470K cache-read tokens as free.
+    These tests fail if that regression returns."""
+
+    A, B_FRESH, B_CACHED, THROUGHPUT = 0.01, 1e-6, 1e-7, 10_000.0
+
+    def _record(self, i, fresh_in, cache_read, cache_write, out):
+        from harness.proxy import CallRecord
+
+        minutes = (self.A + self.B_FRESH * (fresh_in + cache_write)
+                   + self.B_CACHED * cache_read + out / self.THROUGHPUT)
+        return CallRecord(seq=i, path="", input_tokens=fresh_in, output_tokens=out,
+                          cache_read_tokens=cache_read, cache_write_tokens=cache_write,
+                          total_s=minutes * 60.0)
+
+    def test_a_fully_cached_log_fits_where_the_old_regressor_was_singular(self) -> None:
+        # Billed input constant at 2 on every call -- the exact shape of the
+        # real overnight log -- with the context living in the cache columns.
+        rows = [self._record(i, 2, cr, cw, out) for i, (cr, cw, out) in enumerate([
+            (0, 1600, 800), (2400, 900, 300), (5200, 700, 1200),
+            (9100, 500, 500), (14000, 400, 950),
+        ])]
+        tm = fit_timing_model(rows)
+        self.assertAlmostEqual(tm.a_minutes, self.A, places=6)
+        self.assertAlmostEqual(tm.b_minutes_per_input_token, self.B_FRESH, places=9)
+        self.assertIsNotNone(tm.b_cached_minutes_per_token)
+        self.assertAlmostEqual(tm.b_cached_minutes_per_token, self.B_CACHED, places=9)
+        self.assertAlmostEqual(tm.output_tokens_per_minute, self.THROUGHPUT, places=2)
+        # Cached prefill is the CHEAPER term -- that asymmetry is the reason
+        # for the split fit, and the fallback below refuses its inversion.
+        self.assertLess(tm.b_cached_minutes_per_token, tm.b_minutes_per_input_token)
+
+    def test_an_uncached_log_reads_exactly_as_before(self) -> None:
+        from harness.calibrate import call_minutes
+        from harness.proxy import CallRecord
+
+        rows = [self._record(i, f, 0, 0, o) for i, (f, o) in enumerate(
+            [(1000, 100), (5000, 300), (1000, 300), (5000, 100), (3000, 200)])]
+        tm = fit_timing_model(rows)
+        self.assertIsNone(tm.b_cached_minutes_per_token)  # blended: nothing to split
+        rec = CallRecord(seq=9, path="", input_tokens=2000, output_tokens=150, total_s=1.0)
+        self.assertAlmostEqual(
+            call_minutes(rec, tm),
+            tm.a_minutes + tm.b_minutes_per_input_token * 2000 + 150 / tm.output_tokens_per_minute,
+            places=12,
+        )
+
+    def test_cached_prefill_fitting_slower_than_fresh_falls_back_to_blended(self) -> None:
+        # Data generated with the coefficients physically backwards: cache reads
+        # ten times SLOWER than fresh prefill. The split fit recovers exactly
+        # that, which is grounds to distrust the split, not to publish it.
+        a, b_fresh, b_cached, thr = 0.01, 1e-7, 1e-6, 10_000.0
+        from harness.proxy import CallRecord
+
+        rows = []
+        for i, (f, cr, o) in enumerate([(1000, 0, 800), (2000, 2400, 300),
+                                        (5000, 5200, 1200), (1500, 9100, 500),
+                                        (4200, 14000, 950)]):
+            minutes = a + b_fresh * f + b_cached * cr + o / thr
+            rows.append(CallRecord(seq=i, path="", input_tokens=f, output_tokens=o,
+                                   cache_read_tokens=cr, total_s=minutes * 60.0))
+        tm = fit_timing_model(rows)
+        self.assertIsNone(tm.b_cached_minutes_per_token)  # fell back to blended
+        self.assertGreaterEqual(tm.b_minutes_per_input_token, 0.0)
+
+    def test_call_minutes_prices_cache_reads(self) -> None:
+        from harness.calibrate import call_minutes
+        from harness.proxy import CallRecord
+
+        tm = TimingModel(0.0, 1e-6, 1e12, b_cached_minutes_per_token=1e-7)
+        rec = CallRecord(seq=0, path="", input_tokens=10, output_tokens=0,
+                         cache_read_tokens=1000, cache_write_tokens=90, total_s=1.0)
+        # Fresh = 10 uncached + 90 written; cached = 1000 read.
+        self.assertAlmostEqual(call_minutes(rec, tm), 1e-6 * 100 + 1e-7 * 1000, places=15)
+
+
+class TestAbsorptionSeesTheCachedContextStep(unittest.TestCase):
+    """The real fan-out log: billed input constant at 2, all context growth in
+    the cache columns. The old extractor read a zero step off every such trace
+    and reported 'no lead turn followed a spawn' -- wrong on both counts: the
+    turns existed, and the step was there, in the fields it was not reading."""
+
+    def _cached_fanout_trace(self, grow: int) -> Trace:
+        from harness.trace import SpawnRecord
+
+        trace = Trace(scenario_id="s", model="m")
+        trace.calls.append(
+            ModelCall(actor=LEAD, index=0, input_tokens=2, output_tokens=50,
+                      cache_read_tokens=1000, cache_write_tokens=300,
+                      tools_invoked=("spawn_subagent",), t_request=0.0)
+        )
+        trace.calls.append(
+            ModelCall(actor=LEAD, index=1, input_tokens=2, output_tokens=30,
+                      cache_read_tokens=1300 + grow, cache_write_tokens=200,
+                      tools_invoked=("finish",), t_request=5.0)
+        )
+        trace.spawns.append(SpawnRecord(index=0, batch=0, instruction="do it", files=()))
+        trace.calls.append(
+            ModelCall(actor="subagent:0", index=0, input_tokens=400,
+                      output_tokens=60, t_request=1.0)
+        )
+        return trace
+
+    def test_the_step_is_read_from_the_cache_columns(self) -> None:
+        tm = TimingModel(1.0, 0.001, 1e12, b_cached_minutes_per_token=0.0005)
+        out = spawn_overhead([self._cached_fanout_trace(grow=4000)], PRICE, tm)
+        # ctx before = 2 + 300 + 1000 = 1302; after = 2 + 200 + 5300 = 5502.
+        self.assertIsNotNone(out["absorb_dollars_per_node"])
+        self.assertAlmostEqual(out["absorb_dollars_per_node"], 4200 * 3.0 / 1e6, places=12)
+        # Absorbed tokens are cache READS on every later turn, so the cached
+        # coefficient prices their minutes, not the fresh one.
+        self.assertAlmostEqual(out["absorb_minutes_per_node"], 4200 * 0.0005, places=9)
+
+    def test_zero_growth_names_the_real_failure(self) -> None:
+        out = spawn_overhead([self._cached_fanout_trace(grow=-500)], PRICE,
+                             TimingModel(1.0, 0.0, 1e12))
+        self.assertIsNone(out["absorb_dollars_per_node"])
+        self.assertIn("post-spawn", out["absorb_why"])
+
+    def test_no_post_spawn_turn_keeps_the_structural_message(self) -> None:
+        trace = Trace(scenario_id="s", model="m")
+        trace.calls.append(ModelCall(actor=LEAD, index=0, input_tokens=500, output_tokens=50,
+                                     tools_invoked=("list_files",), t_request=0.0))
+        trace.calls.append(ModelCall(actor=LEAD, index=1, input_tokens=600, output_tokens=200,
+                                     tools_invoked=("spawn_subagent",), t_request=1.0))
+        out = spawn_overhead([trace], PRICE, TimingModel(1.0, 0.0, 1e12))
+        self.assertIn("no lead turn followed a spawn", out["absorb_why"])
+
+
+class TestCalibrationAbortsBeforeSpendOnADegenerateFirstTrace(unittest.TestCase):
+    """The first real calibration spent its whole overnight budget before the
+    extraction reported an unfittable timing model. The gate reads the regressor
+    columns off the first serial trace and stops the run right there."""
+
+    def test_constant_columns_abort_after_one_trace(self) -> None:
+        scn = scenario(n=3, size=1)
+        flat = {
+            "lead": [
+                *[
+                    Turn(tools=(("write_file", {"path": module_path(n),
+                                                "content": scn.reference[n]}),),
+                         input_tokens=800, output_tokens=100)
+                    for n in scn.dag.ids
+                ],
+                Turn(tools=(("finish", {"summary": "done"}),),
+                     input_tokens=800, output_tokens=100),
+            ]
+        }
+        with ProtocolUpstream("anthropic", flat) as up:
+            client = AnthropicClient(model="fake-model", api_key="k", base_url=up.base_url)
+            with tempfile.TemporaryDirectory() as out:
+                with self.assertRaises(ValueError) as caught:
+                    run_calibration(scn, client, PRICE, out, source="flat 2026-08-23",
+                                    orderings=2, repeats=2, max_turns=10)
+                traces = sorted(Path(out).glob("trace-*.json"))
+                # One trace on disk, seven runs never launched.
+                self.assertEqual(len(traces), 1, traces)
+        self.assertIn("constant", str(caught.exception))
+
+
 class TestBundledRunMakesTheSlopeIdentifiable(unittest.TestCase):
     def test_bundled_plan_briefs_two_distinct_block_sizes(self) -> None:
         from harness.calibration import bundled_plan
@@ -542,6 +810,8 @@ class TestCalibrationMakesRegretComparable(unittest.TestCase):
             "test 2026-08-23",
             block_dollars_curve=((1, 0.0030), (2, 0.0078), (3, 0.0144), (5, 0.0228)),
             block_minutes_curve=((1, 0.00060), (2, 0.00147), (3, 0.00262), (5, 0.00404)),
+            sub_block_dollars_curve=((1, 0.0044), (2, 0.0102), (3, 0.0181), (5, 0.0290)),
+            sub_block_minutes_curve=((1, 0.00082), (2, 0.00188), (3, 0.00325), (5, 0.00500)),
             spawn_fixed_dollars=0.00255,
             brief_dollars_per_node=0.00135,
             brief_minutes=0.00034,

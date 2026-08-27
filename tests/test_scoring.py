@@ -139,6 +139,39 @@ class TestRegret(unittest.TestCase):
         dear = self._score(trace(calls=400), trace(calls=1))
         self.assertFalse(dear.beat_all_inline)
 
+    def test_beat_all_inline_prefers_the_measured_run_over_the_model_price(self) -> None:
+        # The estimation gate showed the model prices all-inline ~13% low,
+        # which makes always-serial artificially hard to beat -- a bias toward
+        # the "agents cannot beat serial" headline. When an executed inline
+        # run exists, its measured objective is the comparison, full stop.
+        from scoring.regret import ScoreCard, Stakes
+
+        st = Stakes(oracle_objective=1.0, all_inline_objective=10.0,
+                    max_fanout_objective=12.0, oracle_k=0)
+        base = dict(scenario_id="s", beta=0.0, agent_objective=5.0, stakes=st)
+        self.assertTrue(ScoreCard(**base).beat_all_inline)  # model says 10
+        measured = ScoreCard(**base, measured_all_inline=4.9)  # reality says 4.9
+        self.assertFalse(measured.beat_all_inline)
+
+    def test_model_best_refuses_to_call_a_near_tie(self) -> None:
+        # cal-opus-v2's gate verdict: the model orders extremes correctly and
+        # fumbles only near-ties. So inside the noise floor the SIMPLEST plan
+        # is executed; outside it, the model's cheapest still wins.
+        from generator.oracle import Plan, PlanResult
+        from scoring.regret import model_best
+
+        simple = PlanResult(Plan(frozenset({"a", "b"}), ()), cost=1.02, latency=1.0, order=())
+        fancy = PlanResult(
+            Plan(frozenset(), (frozenset({"a"}), frozenset({"b"}))),
+            cost=1.00, latency=1.0, order=(0, 1),
+        )
+        within = model_best([simple, fancy], 0.0, floors=(0.05, None))
+        self.assertEqual(within.plan.k, 0)  # $0.02 apart, floor $0.05: near-tie
+        outside = model_best([simple, fancy], 0.0, floors=(0.001, None))
+        self.assertEqual(outside.plan.k, 2)  # gap exceeds the floor: model calls it
+        no_floors = model_best([simple, fancy], 0.0)
+        self.assertEqual(no_floors.plan.k, 2)  # old exact-argmin behaviour
+
 
 class TestExclusions(unittest.TestCase):
     """What must never be scored. Each of these would produce a plausible number."""

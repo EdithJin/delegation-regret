@@ -132,6 +132,41 @@ class TestCalibrationScenario(unittest.TestCase):
         self.assertEqual(a.dag.edges, b.dag.edges)
 
 
+class TestReplayWritesTheFileTheNextCommandNeeds(unittest.TestCase):
+    """The rescue case: a killed run whose traces survived but whose extraction
+    never ran. `replay` itself is a checker and never writes -- the CLI must,
+    or its own printed `next: --calibration ...` hint points at a file that
+    does not exist. That is exactly how the first real calibration ended."""
+
+    def test_replay_writes_calibration_json(self) -> None:
+        from generator.templates import module_path
+        from harness.trace import LEAD, ModelCall, Trace, WriteEvent
+
+        scn = calibration_scenario(_Args())
+        with tempfile.TemporaryDirectory() as out:
+            trace = Trace(scenario_id=scn.id, model="claude-opus-5")
+            for i, node in enumerate(scn.dag.ids):
+                trace.calls.append(
+                    ModelCall(actor=LEAD, index=i, input_tokens=700 + 300 * i,
+                              output_tokens=60 + 40 * i, total_s=4.0 + i,
+                              t_request=float(i))
+                )
+                trace.write_events.append(
+                    WriteEvent(path=module_path(node), actor=LEAD, t=float(i) + 0.5)
+                )
+            trace.write(Path(out) / "trace-serial-o0-r0.json")
+            code, _ = run_cli("calibrate", "--model", "claude-opus-5", "--replay",
+                              "--out", out)
+            self.assertEqual(code, 0)
+            self.assertTrue((Path(out) / "calibration.json").exists())
+            # And a second replay against its own published file is silent
+            # agreement, not a spurious overwrite warning.
+            code, text = run_cli("calibrate", "--model", "claude-opus-5", "--replay",
+                                 "--out", out)
+            self.assertEqual(code, 0)
+            self.assertNotIn("DISAGREES", text)
+
+
 class TestExperimentRefusals(unittest.TestCase):
     def _calibration(self, tmp: str, *, model: str, timing: dict) -> Path:
         result = CalibrationResult(

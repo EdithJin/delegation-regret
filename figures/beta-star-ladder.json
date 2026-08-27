@@ -1,0 +1,144 @@
+{
+  "what": "Measured delegation break-even beta*(node size): executed serial vs max-fanout arm pairs (bench/probe.py, one fresh process per point). beta* = (fanout$ - serial$) / (serial_min - fanout_min); null = no latency win (dominated). 'rungs' = the wide-4 seed-11 curve; 'n_axis_points' vary node count at fixed size (different scenario family).",
+  "date": "2026-08-26",
+  "model": "claude-opus-5",
+  "calibration": "results/cal-opus-v2/calibration.json",
+  "floors": {
+    "dollars": 0.029721999999999915,
+    "minutes": 0.11953589546442213
+  },
+  "total_spend_dollars": 10.606,
+  "single_draw_caveat": "one run per arm; rung 8's latency delta is 1.6x the minutes floor (classification robust, exact value not); rung 3 dominated; 15/25 deltas 4.6x/8x floor; rung 40 attribution-invalid (see its validity_note); wide8-s15 clean.",
+  "serial_strategy_boundary": "hand-repair (write_file per module, turns 9-14) through size 25 and wide-8; programmatic repair (run_python only, 17 turns) at size 40.",
+  "rungs": [
+    {
+      "node_size": 3,
+      "n_nodes": 4,
+      "scenario": "wide4-s3-11",
+      "serial": {
+        "dollars": 0.1865,
+        "minutes": 0.8896
+      },
+      "fanout": {
+        "dollars": 0.3805,
+        "minutes": 1.1049
+      },
+      "beta_star_per_min": null,
+      "latency_ratio_serial_over_fanout": 0.805,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide4-s3/",
+        "spend_dollars": 0.567
+      }
+    },
+    {
+      "node_size": 8,
+      "n_nodes": 4,
+      "scenario": "wide4-s8-11",
+      "serial": {
+        "dollars": 0.3502,
+        "minutes": 1.4448
+      },
+      "fanout": {
+        "dollars": 0.7079,
+        "minutes": 1.2519
+      },
+      "beta_star_per_min": 1.8547,
+      "latency_ratio_serial_over_fanout": 1.154,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide4-s8/",
+        "spend_dollars": 1.058
+      }
+    },
+    {
+      "node_size": 15,
+      "n_nodes": 4,
+      "scenario": "wide4-s15-11",
+      "serial": {
+        "dollars": 0.5292,
+        "minutes": 2.0017
+      },
+      "fanout": {
+        "dollars": 0.832,
+        "minutes": 1.451
+      },
+      "beta_star_per_min": 0.5498,
+      "latency_ratio_serial_over_fanout": 1.38,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide4-s15/",
+        "spend_dollars": 1.3613
+      }
+    },
+    {
+      "node_size": 25,
+      "n_nodes": 4,
+      "scenario": "wide4-s25-11",
+      "serial": {
+        "dollars": 0.753,
+        "minutes": 2.7237
+      },
+      "fanout": {
+        "dollars": 1.2009,
+        "minutes": 1.7629
+      },
+      "beta_star_per_min": 0.4662,
+      "latency_ratio_serial_over_fanout": 1.545,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide4-s25/",
+        "spend_dollars": 1.954
+      }
+    },
+    {
+      "node_size": 40,
+      "n_nodes": 4,
+      "scenario": "wide4-s40-11",
+      "serial": {
+        "dollars": 1.4876,
+        "minutes": 5.2237
+      },
+      "fanout": {
+        "dollars": 1.5732,
+        "minutes": 2.4565
+      },
+      "beta_star_per_min": 0.0309,
+      "latency_ratio_serial_over_fanout": 2.127,
+      "valid": false,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide4-s40/",
+        "spend_dollars": 3.0608
+      },
+      "validity_note": "ATTRIBUTION-INVALID, economically indicative only: serial arm succeeded and is genuinely serial (k=0, proxy-verified) but repaired all 160 defects via run_python with zero write_file calls, so write-attribution compliance failed (the V1 hole). Marks the payload's strategy-shift boundary: hand-repair through size 25 (5 repetitions per defect kind), programmatic repair at 40 (8 per kind). Indicative beta* ~= $0.03/min (premium $0.08 ~= 2.7x the dollar floor; latency ratio 2.12x) -- dollar-dominance imminent on the block-size axis, claimable only after the item-14 module-hashing fix restores attribution at this scale."
+    }
+  ],
+  "n_axis_points": [
+    {
+      "node_size": 15,
+      "n_nodes": 8,
+      "scenario": "wide8-s15-11",
+      "serial": {
+        "dollars": 0.9332,
+        "minutes": 3.2217
+      },
+      "fanout": {
+        "dollars": 1.6717,
+        "minutes": 2.663
+      },
+      "beta_star_per_min": 1.3216,
+      "latency_ratio_serial_over_fanout": 1.21,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-wide8-s15/",
+        "spend_dollars": 2.6049
+      }
+    }
+  ]
+}

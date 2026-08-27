@@ -46,9 +46,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from generator.manifest import Manifest, ScenarioSpec
-from generator.oracle import CostModel, enumerate_plans, evaluate, unmeasured
+from generator.oracle import CostModel, all_inline, enumerate_plans, evaluate, unmeasured
 from scoring.aggregate import Aggregate, aggregate
-from scoring.regret import ScoreCard, score
+from scoring.regret import ScoreCard, model_best, score
 from scoring.validate import (
     OrderingReport,
     anti_oracle,
@@ -171,12 +171,19 @@ def run_experiment(
     budget: Budget | None = None,
     retry: RetryPolicy | None = None,
     use_proxy: bool = True,
+    floors: tuple | None = None,
 ) -> Results:
     """Run a manifest end to end and write a stamped results file.
 
     `calibration_source` is required, not defaulted. It is the string
     `CostModel.calibrate` stamped onto every measured constant, and without it a
     results file cannot say which run its dollars came from.
+
+    `floors` is the calibration's (dollar, minute) materiality pair
+    (`CalibrationResult.floors`); it sets the tolerance at which two plans
+    count as the same outcome in the Tier-A test and the implied-beta
+    tie-break. Omitted, both run at exact float equality -- which the oracle's
+    own provenance notes is not a meaningful test on measured constants.
 
     Traces are written as they are produced, so a crash halfway through costs the
     remaining scenarios and not the completed ones.
@@ -233,9 +240,11 @@ def run_experiment(
             # oracle plan at beta=0 is usually not the plan at beta=1, and paying
             # twice for the same execution would be waste -- but scoring beta=1
             # against beta=0's plan would be measuring the wrong baseline.
-            best_by_beta = {
-                b: min(priced, key=lambda r: (r.objective(b), r.plan.k)) for b in betas
-            }
+            # `model_best` is floor-aware: the estimation gate showed the model
+            # fumbles only near-ties, so among plans inside the noise floor the
+            # simplest one is executed rather than letting the model call a
+            # coin flip.
+            best_by_beta = {b: model_best(priced, b, floors) for b in betas}
             baselines: dict[tuple, Trace] = {}
             for b in betas:
                 key = _plan_key(best_by_beta[b].plan)
@@ -246,17 +255,38 @@ def run_experiment(
                     )
                     baseline_traces.append(baselines[key])
 
+            # ALWAYS-SERIAL IS EXECUTED, NOT PRICED (corrected Aug 25). The
+            # beats-all-inline flag used to compare the agent's measured
+            # objective against the plan table's all-inline price -- which the
+            # estimation gate showed runs ~13% low, making serial artificially
+            # hard to beat, a bias toward the headline. One extra run per
+            # scenario buys a measurement-vs-measurement flag AND a fresh
+            # out-of-sample estimation-gate sample on every scenario (the
+            # model's inline prediction is on the card next to this run's
+            # measured objective). Reused when a baseline already IS all-inline.
+            inline_plan = all_inline(scenario.dag)
+            inline_run = baselines.get(_plan_key(inline_plan))
+            if inline_run is None:
+                inline_run = run(spec, inline_plan, f"inline-r{repeat}",
+                                 condition="all-inline")
+            inline_ok = inline_run.succeeded and not any(
+                n.startswith("PLAN NOT FOLLOWED") for n in inline_run.notes
+            )
+
             arm = run(spec, None, f"disclosed-r{repeat}", condition="agent-disclosed",
                       disclose=True) if disclosed else None
 
             for b in betas:
                 base = baselines[_plan_key(best_by_beta[b].plan)]
-                card = score(agent, base, scenario.dag, cost_model, b, price, timing, priced)
+                inline_obj = inline_run.objective(price, timing, b) if inline_ok else None
+                card = score(agent, base, scenario.dag, cost_model, b, price, timing,
+                             priced, floors=floors, measured_all_inline=inline_obj)
                 results.cards.append(card)
                 hidden_cards[b].append(card)
                 if arm is not None:
                     disclosed_cards[b].append(
-                        score(arm, base, scenario.dag, cost_model, b, price, timing, priced)
+                        score(arm, base, scenario.dag, cost_model, b, price, timing,
+                              priced, floors=floors, measured_all_inline=inline_obj)
                     )
 
         # The anti-oracle check runs on a subset: it is not a measurement of the

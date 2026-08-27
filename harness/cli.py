@@ -48,18 +48,20 @@ model-specific.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import fields
 from pathlib import Path
 
 from generator.dag import SHAPES, sample_dag
-from generator.manifest import ANCHOR, CORE, Manifest, heldout
+from generator.manifest import ANCHOR, CORE, Manifest, ScenarioSpec, heldout
 from generator.manifest import load as load_manifest
 from generator.manifest import write as write_manifest
 from generator.oracle import unmeasured
 from generator.scenario import Scenario, build_scenario
 
+from .audit import audit_summary, eps_from_calibration, run_audit
 from .calibrate import PriceSheet, TimingModel
 from .calibration import CalibrationResult, replay, run_calibration
 from .client import AnthropicClient
@@ -80,6 +82,15 @@ ANTHROPIC_API = "https://api.anthropic.com"
 # sheet is the default because every planned run lands inside the window; the
 # "@list" entry exists so any absolute dollar figure can be restated at list
 # rates, which the write-up is required to do (Cost-And-Funding-Notes item 5).
+#
+# claude-opus-5 is the matrix leg -- lead and subagents alike, one model per
+# leg (the runner shares a single client by design; design doc section 7).
+# There is deliberately no fable-tier sheet: rejected Aug 25 for the matrix --
+# 2x rates, tier mismatch against any workhorse-tier comparator, and its
+# refusal stop reason cannot be mitigated inside a pinned-model leg, because
+# the sanctioned mitigation (server-side fallbacks) swaps models mid-run.
+# Reasoning in design doc section 10; a flagship-subset panel is queued for
+# October, and only then does a fable sheet get added here.
 PRICE_SHEETS: dict[str, PriceSheet] = {
     "claude-opus-5": PriceSheet(
         model="claude-opus-5", as_of="2026-08-24",
@@ -242,6 +253,26 @@ def cmd_calibrate(args) -> int:
     print(f"  scenario {scenario.dag.shape} n={len(scenario.dag.nodes)} -> {out}")
     if args.replay:
         result = replay(out, scenario, price, source=source)
+        # `replay` itself is a checker and never writes. But the CLI's contract
+        # is "one command from a pinned model to a file", and the rescue case --
+        # a killed run whose traces survived but whose extraction never ran --
+        # ends here with the report printed and nothing for `experiment` to
+        # consume. So the CLI writes the re-derived result, surfacing any
+        # disagreement with a previously published file first rather than
+        # clobbering the evidence that the extraction changed.
+        published = out / "calibration.json"
+        if published.exists():
+            prior = CalibrationResult.load(published)
+            same = json.dumps(prior.constants, sort_keys=True, default=str) == json.dumps(
+                result.constants, sort_keys=True, default=str
+            )
+            if not same:
+                print(
+                    "  ! replay DISAGREES with the published calibration.json -- the "
+                    "extraction changed since it was written. Overwriting with the "
+                    "re-derived constants; the traces stay the source of truth."
+                )
+        result.write(out)
     else:
         client = build_client(args, price)
         result = run_calibration(
@@ -285,6 +316,24 @@ def cmd_experiment(args) -> int:
         print(f"  ! {len(still)} constant(s) still placeholder ({', '.join(still)}) -- "
               "every card will be marked NOT COMPARABLE.", file=sys.stderr)
 
+    # The calibration's measured noise floors set what "the same outcome" means
+    # in the Tier-A test and the implied-beta tie-break. Without them scoring
+    # runs at exact float equality, which is a placeholder, not a test.
+    floors = None
+    fd = (calib.floors or {}).get("dollars")
+    fm = (calib.floors or {}).get("minutes")
+    if fd or fm:
+        floors = (fd, fm)
+        parts = []
+        if fd is not None:
+            parts.append(f"${fd:.4g}")
+        if fm is not None:
+            parts.append(f"{fm:.4g} min")
+        print(f"  materiality floors: {' + beta * '.join(parts)}")
+    else:
+        print("  ! calibration carries no materiality floors; outcome ties are "
+              "judged at exact float equality", file=sys.stderr)
+
     client = build_client(args, price)
     betas = tuple(float(b) for b in args.betas.split(","))
     print(f"  model {price.model}  manifest {manifest.name} ({len(manifest)} scenarios, "
@@ -299,9 +348,85 @@ def cmd_experiment(args) -> int:
         ordering_subset=args.ordering_subset,
         max_turns=args.max_turns,
         budget=_budget(args),
+        floors=floors,
     )
     print()
     print(results.report())
+    return 0
+
+
+def _load_calibration(args) -> tuple:
+    """(calibration, timing, cost_model, floors) with the experiment command's
+    refusals: wrong model, missing timing model, missing floors for an audit."""
+    price = price_sheet(args.model)
+    calib = CalibrationResult.load(args.calibration)
+    calibrated_model = (calib.price_sheet or {}).get("model", "")
+    if calibrated_model != price.model:
+        raise SystemExit(
+            f"calibration {args.calibration} was measured on {calibrated_model!r}, "
+            f"but --model resolves to {price.model!r}. Curves do not transfer."
+        )
+    timing_keys = {f.name for f in fields(TimingModel)}
+    timing_dict = {k: v for k, v in (calib.timing_model or {}).items() if k in timing_keys}
+    if not timing_dict:
+        raise SystemExit("the calibration has no timing model; see its 'skipped' section.")
+    floors = ((calib.floors or {}).get("dollars"), (calib.floors or {}).get("minutes"))
+    return calib, TimingModel(**timing_dict), calib.to_cost_model(), floors
+
+
+def cmd_audit(args) -> int:
+    """The committee audit: execute every plan that could win on one scenario.
+
+    Epsilon is read off the calibration's own estimation gate unless overridden;
+    --dry-run prices the table without a key or a dollar, which is also how the
+    audit's enumeration and collapse stay reproducible by anyone.
+    """
+    price = price_sheet(args.model)
+    calib, timing, cm, floors = _load_calibration(args)
+    if floors[0] is None:
+        raise SystemExit(
+            "the calibration carries no dollar floor; outcome-distinct collapse "
+            "needs a resolution. Re-run calibration QA first."
+        )
+    eps = args.eps if args.eps is not None else eps_from_calibration(calib)
+    scenario = ScenarioSpec(args.shape, args.n, args.size, args.seed).build()
+    client = None if args.dry_run else build_client(args, price)
+    print(f"  model {price.model}  scenario {scenario.id}  beta {args.beta:g}  "
+          f"eps {'-' if eps is None else f'{eps:.0%}'} "
+          f"({'override' if args.eps is not None else 'from estimation gate'})")
+    result = run_audit(
+        scenario, client, price, timing, cm, args.out,
+        beta=args.beta, eps=eps, floors=floors,
+        band_only=args.band_only, dry_run=args.dry_run,
+        max_turns=args.max_turns, budget=_budget(args),
+    )
+    print()
+    print(result.report())
+    return 0
+
+
+def cmd_audit_summary(args) -> int:
+    """Combine per-scenario audits into the report's X% -- the pre-registered
+    worst-case rule, refusing a certified X when any audit cannot contribute."""
+    paths = sorted(Path(args.dir).glob("*/audit.json"))
+    if not paths:
+        raise SystemExit(f"no audit.json under {args.dir}/*/")
+    s = audit_summary(paths)
+    tau = s["mean_tau"]
+    print(f"  audits: {s['n_audits']}   champion retention: {s['champion_retention']}"
+          f"   mean tau: {'-' if tau is None else format(tau, '+.2f')}")
+    for row in s["per_scenario"]:
+        x = "-" if row["x"] is None else f"{row['x']:.0%}"
+        print(f"    {row['scenario']:<16} champion predicted rank {row['r']}/{row['N']}"
+              f"  x={x}  in_band={row['in_band']}  complete={row['complete']}")
+    for c in s["caveats"]:
+        print(f"  ! {c}")
+    if s["safe_filter_X"] is not None:
+        print(f"\n  SAFE FILTER X = {s['safe_filter_X']:.0%} (worst case across audits; "
+              "the calculation may discard this bottom fraction of its plan table "
+              "without ever discarding a measured champion)")
+    else:
+        print("\n  no certified X: at least one audit is band-only or incomplete")
     return 0
 
 
@@ -351,6 +476,27 @@ def main(argv: list[str] | None = None) -> int:
                      help="re-derive constants from traces already in --out; no runs, no key")
     cal.add_argument("--out", required=True)
     cal.set_defaults(func=cmd_calibrate)
+
+    aud = sub.add_parser("audit", help="committee audit: execute every plan that could win")
+    add_endpoint_args(aud)
+    aud.add_argument("--calibration", required=True, help="path to calibration.json")
+    aud.add_argument("--shape", required=True, choices=tuple(sorted(SHAPES)))
+    aud.add_argument("--n", type=int, required=True)
+    aud.add_argument("--size", type=int, default=3, help="node size, matching the manifest cell")
+    aud.add_argument("--seed", type=int, required=True)
+    aud.add_argument("--beta", type=float, default=1.0)
+    aud.add_argument("--eps", type=float, default=None,
+                     help="override the estimation-gate epsilon (default: read from calibration)")
+    aud.add_argument("--band-only", action="store_true",
+                     help="execute only the 2-eps band; no safe-filter rate")
+    aud.add_argument("--dry-run", action="store_true",
+                     help="price the table and stop; no key, no spend")
+    aud.add_argument("--out", required=True)
+    aud.set_defaults(func=cmd_audit)
+
+    aus = sub.add_parser("audit-summary", help="combine audits into the pre-registered X%")
+    aus.add_argument("dir", help="directory containing per-scenario audit dirs")
+    aus.set_defaults(func=cmd_audit_summary)
 
     exp = sub.add_parser("experiment", help="run a manifest and write a stamped results file")
     add_endpoint_args(exp)

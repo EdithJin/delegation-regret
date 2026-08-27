@@ -37,6 +37,9 @@ CALIBRATED = CostModel().calibrate(
     "test 2026-08-23",
     block_dollars_curve=((1, 0.0030), (2, 0.0078), (3, 0.0144), (5, 0.0228)),
     block_minutes_curve=((1, 0.00060), (2, 0.00147), (3, 0.00262), (5, 0.00404)),
+    # Dearer than the lead curve on purpose: subagents pay fresh-context costs.
+    sub_block_dollars_curve=((1, 0.0044), (2, 0.0102), (3, 0.0181), (5, 0.0290)),
+    sub_block_minutes_curve=((1, 0.00082), (2, 0.00188), (3, 0.00325), (5, 0.00500)),
     spawn_fixed_dollars=0.00255,
     brief_dollars_per_node=0.00135,
     brief_minutes=0.00034,
@@ -248,9 +251,11 @@ class TestOutOfOrderEdits(unittest.TestCase):
 
 class TestMaterialityFloor(unittest.TestCase):
     """`OUTCOME_TOL`'s default is exact float equality, which tests nothing on
-    values derived from measured constants carrying confidence intervals."""
+    values derived from measured constants carrying confidence intervals. The
+    floor is PER AXIS -- dollars and minutes are not comparable -- and the
+    objective floor at a beta is dollars + beta * minutes."""
 
-    def test_the_floor_is_the_larger_of_the_two_noise_sources(self) -> None:
+    def test_the_dollar_floor_is_the_per_bucket_absolute_spread(self) -> None:
         from harness.calibration import CalibrationResult
 
         result = CalibrationResult(
@@ -259,10 +264,14 @@ class TestMaterialityFloor(unittest.TestCase):
             diagnostics={"dollar_disagreement": {4: 0.05},
                          "timing_residual_rms_minutes": 0.001},
         )
-        # dollar floor = 0.05 * 0.10 = 0.005, which beats the 0.001 minute floor.
+        # spread AT the bucket times the mean AT that bucket: 0.05 * 0.10. The
+        # old worst-relative-times-largest form multiplied the small-block
+        # percentage by the top-of-curve value and once produced a floor larger
+        # than the entire all-inline objective.
         self.assertAlmostEqual(materiality_floor(result), 0.005)
+        self.assertAlmostEqual(materiality_floor(result, beta=1.0), 0.006)
 
-    def test_the_minute_residual_wins_when_it_is_larger(self) -> None:
+    def test_the_minute_floor_scales_with_beta_never_maxes_across_units(self) -> None:
         from harness.calibration import CalibrationResult
 
         result = CalibrationResult(
@@ -271,15 +280,17 @@ class TestMaterialityFloor(unittest.TestCase):
             diagnostics={"dollar_disagreement": {4: 0.001},
                          "timing_residual_rms_minutes": 0.02},
         )
-        self.assertAlmostEqual(materiality_floor(result), 0.02)
+        # At beta=0 the minutes noise cannot move the objective, so it cannot
+        # move the floor either; at beta=1 it enters in the objective's units.
+        self.assertAlmostEqual(materiality_floor(result), 0.0001)
+        self.assertAlmostEqual(materiality_floor(result, beta=1.0), 0.0201)
 
     def test_no_diagnostics_yields_no_floor_rather_than_a_guess(self) -> None:
         from harness.calibration import CalibrationResult
 
         self.assertIsNone(materiality_floor(CalibrationResult(source="s")))
 
-    def test_a_real_calibration_produces_a_floor_far_above_float_equality(self) -> None:
-        from generator.oracle import OUTCOME_TOL
+    def test_a_real_calibration_publishes_its_floors(self) -> None:
         from harness.calibration import run_calibration
 
         import tests.test_calibration as C
@@ -290,8 +301,13 @@ class TestMaterialityFloor(unittest.TestCase):
             with tempfile.TemporaryDirectory() as out:
                 result = run_calibration(scn, client, C.PRICE, out, source="t",
                                          orderings=2, repeats=1, max_turns=14)
-        self.assertIsNotNone(result.outcome_tol)
-        self.assertGreater(result.outcome_tol, OUTCOME_TOL * 1000)
+        self.assertIn("dollars", result.floors)
+        self.assertIn("minutes", result.floors)
+        # The scripted runs are token-identical, so the dollar spread is
+        # honestly zero; the minutes floor carries the timing fit's residual,
+        # which real socket jitter keeps above literal zero.
+        self.assertIsNotNone(result.floors["dollars"])
+        self.assertGreater(result.floors["minutes"], 0.0)
         self.assertIn("materiality floor", result.report())
 
 
@@ -347,6 +363,22 @@ class TestExperimentDriver(unittest.TestCase):
         for spec in self.manifest.specs:
             self.assertTrue(any(n.startswith(f"{spec.id}-agent") for n in names), spec.id)
             self.assertTrue(any(n.startswith(f"{spec.id}-oracle") for n in names), spec.id)
+
+    def test_beats_all_inline_compares_two_measured_runs(self) -> None:
+        # Always-serial is executed, never merely priced: every scorable card
+        # must carry the measured objective of a real all-inline run (its own
+        # trace, or the baseline when the model's best plan already IS
+        # all-inline), because the model's inline price is known to run low
+        # and would make serial artificially hard to beat.
+        with tempfile.TemporaryDirectory() as out:
+            results = self._run(out, betas=(1.0,), disclosed=False, ordering_subset=0)
+            names = [Path(f).name for f in results.trace_files]
+        for card in results.cards:
+            if not card.excluded:
+                self.assertIsNotNone(card.measured_all_inline, card.scenario_id)
+        # Every scenario has SOME executed source for that number: its own
+        # -inline- arm, or a baseline whose requested plan was already inline.
+        del names  # reuse-vs-fresh is plan-dependent; the card check above is the contract
 
     def test_an_uncalibrated_cost_model_marks_the_whole_run_not_comparable(self) -> None:
         with tempfile.TemporaryDirectory() as out:

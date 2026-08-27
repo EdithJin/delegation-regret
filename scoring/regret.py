@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 
 from generator.dag import DAG
 from generator.oracle import (
+    OUTCOME_TOL,
     CostModel,
     all_inline,
     enumerate_plans,
@@ -61,6 +62,7 @@ __all__ = [
     "ScoreCard",
     "stakes",
     "score",
+    "model_best",
     "implied_beta",
     "intersect_beta",
     "quality_by_executor",
@@ -94,18 +96,55 @@ class Stakes:
         return self.worst_degenerate - self.oracle_objective
 
 
-def stakes(dag: DAG, cm: CostModel, beta: float, results=None) -> Stakes:
+def _axis_tols(floors) -> tuple[float, float]:
+    """(cost tol in dollars, latency tol in minutes) from a calibration's floors.
+
+    A missing or zero floor falls back to OUTCOME_TOL -- exact-equality is the
+    honest default for an axis whose noise was never measured, and a zero
+    tolerance would divide by zero in the rounding tests.
+    """
+    d, m = (floors or (None, None))
+    return (d if d else OUTCOME_TOL), (m if m else OUTCOME_TOL)
+
+
+def model_best(results, beta: float, floors=None):
+    """The plan the model recommends -- refusing to let it call near-ties.
+
+    The estimation gate's verdict on cal-opus-v2 was precise: the composed
+    model orders the plan EXTREMES correctly and fumbles only a near-tie, two
+    plans $0.04 apart against a $0.03 noise floor. So the model is not asked
+    to call ties anymore: among every plan within the floor of its minimum
+    objective, the SIMPLEST (fewest subagents, then cheapest) is selected.
+    That is the conservative reference on both counts -- fewer moving parts to
+    execute, and a within-floor substitution moves the baseline by less than
+    the measurement can resolve, so nothing scoreable changes.
+
+    With no floors the tolerance is zero and this reduces to the old exact
+    argmin with its smallest-k tie-break.
+    """
+    lo = min(r.objective(beta) for r in results)
+    tol = ((floors[0] or 0.0) + beta * (floors[1] or 0.0)) if floors else 0.0
+    near = [r for r in results if r.objective(beta) <= lo + tol]
+    return min(near, key=lambda r: (r.plan.k, r.objective(beta)))
+
+
+def stakes(dag: DAG, cm: CostModel, beta: float, results=None, floors=None) -> Stakes:
     """Price the plan table once and read the three reference points off it.
 
     `results` lets a caller reuse an enumeration across betas -- feasibility does
     not depend on price, and on 8 nodes the evaluation is the expensive half.
+
+    `floors` is the calibration's (dollar, minute) materiality pair; without it
+    the Tier-A test runs at exact float equality, which the oracle's own
+    provenance notes is not a meaningful test on measured constants.
     """
     if results is None:
         results = [evaluate(dag, p, cm) for p in enumerate_plans(dag)]
     by_plan = {r.plan: r for r in results}
-    best = min(results, key=lambda r: (r.objective(beta), r.plan.k))
+    best = model_best(results, beta, floors)
+    tol_cost, tol_latency = _axis_tols(floors)
     return Stakes(
-        tier_a=is_tier_a(results),
+        tier_a=is_tier_a(results, tol=tol_cost, tol_latency=tol_latency),
         oracle_objective=best.objective(beta),
         all_inline_objective=by_plan[all_inline(dag)].objective(beta),
         max_fanout_objective=by_plan[max_fanout(dag)].objective(beta),
@@ -135,6 +174,10 @@ class ScoreCard:
     excluded: bool = False
     reason: str = ""
     warnings: tuple[str, ...] = ()
+    # The objective of an EXECUTED all-inline run, when the experiment ran one.
+    # Supplied by the driver for every scenario since Aug 25; None only on
+    # offline scorings and when the inline arm itself failed.
+    measured_all_inline: float | None = None
 
     @property
     def comparable(self) -> bool:
@@ -147,8 +190,21 @@ class ScoreCard:
 
         A metric no trivial policy can top is worth more than a leaderboard, so
         this is reported next to regret rather than derived from it later.
+
+        MEASUREMENT BEFORE MODEL (corrected Aug 25): this compared the agent's
+        measured objective against the plan table's MODEL-PRICED all-inline
+        objective -- which the estimation gate showed runs ~13% low, making
+        always-serial artificially hard to beat and biasing this flag toward
+        the "agents cannot beat serial" headline. The experiment driver now
+        executes an all-inline arm per scenario and this property prefers that
+        measured value; the model price remains only as the offline fallback,
+        and any number derived from the fallback inherits the gate's bias.
         """
-        if self.excluded or self.agent_objective is None or self.stakes is None:
+        if self.excluded or self.agent_objective is None:
+            return None
+        if self.measured_all_inline is not None:
+            return self.agent_objective < self.measured_all_inline
+        if self.stakes is None:
             return None
         return self.agent_objective < self.stakes.all_inline_objective
 
@@ -230,17 +286,28 @@ def score(
     price: PriceSheet,
     timing: TimingModel,
     results=None,
+    floors=None,
+    measured_all_inline: float | None = None,
 ) -> ScoreCard:
     """Regret for one (scenario, model, beta), or an explicit exclusion.
 
     Both objectives are computed the same way from the same trace fields, which
     is the point of measuring the baseline rather than predicting it: any error
     in the cost model appears on both sides and cancels.
+
+    `floors` is the calibration's (dollar_floor, minute_floor) pair -- see
+    `CalibrationResult.floors`. It sets the tolerance at which two plans count
+    as "the same outcome" in the Tier-A test and the implied-beta tie-break;
+    omitted, both fall back to exact float equality.
+
+    `measured_all_inline` is the objective of an EXECUTED all-inline run; the
+    driver supplies it so `beat_all_inline` compares measurement against
+    measurement rather than against the model's known-low price.
     """
-    st = stakes(dag, cm, beta, results)
+    st = stakes(dag, cm, beta, results, floors=floors)
     warn = _scale_warning(cm)
     agent_k = agent.k
-    interval = implied_beta(dag, cm, agent_k, results)
+    interval = implied_beta(dag, cm, agent_k, results, floors=floors)
 
     reason = _disqualify(agent, baseline)
     if reason:
@@ -257,6 +324,7 @@ def score(
             excluded=True,
             reason=reason,
             warnings=warn,
+            measured_all_inline=measured_all_inline,
         )
 
     a = agent.objective(price, timing, beta)
@@ -281,6 +349,7 @@ def score(
             excluded=True,
             reason="no spread: every plan has the same objective at this beta",
             warnings=warn,
+            measured_all_inline=measured_all_inline,
         )
 
     return ScoreCard(
@@ -297,13 +366,16 @@ def score(
         agent_passed=True,
         baseline_passed=True,
         warnings=warn,
+        measured_all_inline=measured_all_inline,
     )
 
 
 # --------------------------------------------------------------- implied beta
 
 
-def implied_beta(dag: DAG, cm: CostModel, k: int, results=None) -> tuple[float, float] | None:
+def implied_beta(
+    dag: DAG, cm: CostModel, k: int, results=None, floors=None
+) -> tuple[float, float] | None:
     """The beta range that makes spawning exactly `k` optimal, or None.
 
     Run the oracle backwards. `optimal_k_intervals` already returns, exactly and
@@ -318,10 +390,19 @@ def implied_beta(dag: DAG, cm: CostModel, k: int, results=None) -> tuple[float, 
     That is deliberately conservative for this report's purpose: a wider reported
     range makes a model look MORE rationalizable, so it cannot manufacture the
     incoherence result.
+
+    `floors` widens the tie-break to the calibration's measured noise, in the
+    objective's own units at each probe beta.
     """
     if results is None:
         results = [evaluate(dag, p, cm) for p in enumerate_plans(dag)]
-    spans = [(lo, hi) for lo, hi, kk in optimal_k_intervals(results) if kk == k]
+    tol_cost, tol_latency = _axis_tols(floors)
+    minute_tol = tol_latency if floors and (floors[1] or 0) else 0.0
+    spans = [
+        (lo, hi)
+        for lo, hi, kk in optimal_k_intervals(results, tol=tol_cost, minute_tol=minute_tol)
+        if kk == k
+    ]
     if not spans:
         return None
     return (min(lo for lo, _ in spans), max(hi for _, hi in spans))

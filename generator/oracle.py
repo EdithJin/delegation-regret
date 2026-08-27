@@ -60,6 +60,8 @@ __all__ = [
     "linear_curve",
     "block_dollars",
     "block_minutes",
+    "sub_block_dollars",
+    "sub_block_minutes",
     "throughput_penalty",
     "Measured",
     "MeasuredInt",
@@ -148,12 +150,14 @@ def unmeasured(cm: "CostModel") -> tuple[str, ...]:
 # constants are measured, which is why the default is a placeholder rather than a
 # guess dressed as a number.
 #
-# `harness.calibration.materiality_floor` derives it from a completed
-# calibration: the larger of the curve's disagreement across node orderings (the
-# dollar axis) and the timing model's residual (the minutes axis, in the units
-# the objective adds them). Pass it explicitly to `is_tier_a(results, tol=...)`
-# and the tie-break rather than mutating this constant, so one calibration does
-# not silently redefine "equal" for every other run in the process.
+# `harness.calibration` derives the floor from a completed calibration, PER
+# AXIS: a dollar floor from the curve's cross-run disagreement and a minute
+# floor from the timing model's residual (`CalibrationResult.floors`). Pass
+# them explicitly -- `is_tier_a(results, tol=<dollars>, tol_latency=<minutes>)`
+# and `optimal_k_intervals(results, tol=<dollars>, minute_tol=<minutes>)` --
+# rather than mutating this constant, so one calibration does not silently
+# redefine "equal" for every other run in the process. `scoring.regret` wires
+# them through `score(..., floors=(dollars, minutes))`.
 OUTCOME_TOL = 1e-9
 
 
@@ -217,10 +221,12 @@ class CostModel:
         ((100, 10.0),),
         status="placeholder",
         how=(
-            "Serial calibration run, spawning disabled. Segment the proxy call log at each "
-            "subtask completion; plot cumulative billed dollars against cumulative size units. "
-            "Average >=3 node orderings x 2 repeats and report the spread -- disagreement "
-            "falsifies the units-not-identity assumption. Coverage must reach the largest total "
+            "Serial calibration run, spawning disabled, node order FORCED per run. Segment "
+            "the proxy call log at each subtask completion; plot cumulative billed dollars "
+            "NET OF THE ORIENTATION PREFIX (everything before the first write -- that spend "
+            "is explore_dollars' to charge, once) against cumulative size units. Average >=3 "
+            "distinct orderings x 2 repeats and report the spread -- disagreement falsifies "
+            "the units-not-identity assumption. Coverage must reach the largest total "
             "scenario size or the all-inline plan is priced by extrapolation. Pin the 1-hour "
             "cache TTL first: at the 5-minute default, prefix entries expire during the gaps "
             "while tests run, reads silently become writes at 1.25x, and the curve bends "
@@ -240,6 +246,40 @@ class CostModel:
             "rather than wall clock, which is confounded by rate limits and provider load."
         ),
         sensitivity="CRITICAL. The latency half; sets where fan-out stops paying.",
+    )
+
+    # What a SUBAGENT is billed to work a block, net of its first call (which
+    # `spawn_fixed_dollars` already carries). A separate curve from the lead's,
+    # because the two roles pay different context economics: the serial lead
+    # works inside one warm, cached conversation, while every subagent pays
+    # fresh cache-writes for its seeded context and re-bills its own growing
+    # conversation from zero. Until Aug 25 spawned blocks were priced off the
+    # lead's serial curve, and the estimation gate caught that composition
+    # under-pricing real delegation runs by 38-53% with the plan ranking
+    # inverted -- the pro-spawn direction. The placeholders are numerically
+    # identical to the lead-curve placeholders, so an uncalibrated model prices
+    # both roles the same and asserts nothing about the difference.
+    sub_block_dollars_curve: tuple = MeasuredCurve(
+        ((100, 10.0),),
+        status="placeholder",
+        how=(
+            "From the fan-out and bundled calibration arms: each subagent's own calls, summed, "
+            "minus its first call, keyed on the size units of the nodes attribution says it "
+            "worked. Direct per-block totals -- no regression, no decomposition."
+        ),
+        sensitivity=(
+            "CRITICAL, and one-sided: reusing the lead's serial curve here under-priced "
+            "delegation ~2x on the first preflight and inverted the executed-plan ranking."
+        ),
+    )
+    sub_block_minutes_curve: tuple = MeasuredCurve(
+        ((100, 100.0),),
+        status="placeholder",
+        how=(
+            "Same per-subagent segmentation, in analytic minutes from the fitted timing model, "
+            "minus the first call's minutes."
+        ),
+        sensitivity="CRITICAL. Sets how long a spawned block actually runs in the schedule.",
     )
 
     # the lead's own overhead
@@ -287,7 +327,7 @@ class CostModel:
     brief_dollars_per_node: float = Measured(
         0.01,
         status="placeholder",
-        how="No inference needed. The instruction text in a spawn_subagent call IS output tokens\n            the lead emitted; read the argument length off the trace.",
+        how="The instruction text in a spawn_subagent call IS output tokens the lead emitted.\n            One regression row per spawn: x = nodes the spawn covered (from attribution),\n            y = the spawn's instruction-length share of the turn's billed output tokens.\n            Never whole-turn dollars -- context prefill grows turn over turn and swamps\n            the briefing signal.",
         sensitivity="HIGH. Scales with block size, so it prices wide fan-out specifically.",
     )
     absorb_minutes: float = Measured(
@@ -525,7 +565,7 @@ def block_minutes(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
 
 
 def block_dollars(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
-    """What one agent is billed for working this block in a single context.
+    """What the LEAD is billed for working this block in its own context.
 
     Read straight off the measured curve, keyed on total size units. WHICH nodes
     they are does not enter: the modelling assumption is that block cost depends
@@ -534,6 +574,21 @@ def block_dollars(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
     is checked by calibrating a second node ordering and comparing the curves.
     """
     return _interpolate(cm.block_dollars_curve, _units(dag, block))
+
+
+def sub_block_dollars(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
+    """What a SUBAGENT is billed to work this block, beyond its first call.
+
+    Never the lead's curve: the estimation gate showed that substitution
+    under-prices real delegation runs by ~2x, because a subagent pays fresh-
+    context costs the warm serial lead never sees.
+    """
+    return _interpolate(cm.sub_block_dollars_curve, _units(dag, block))
+
+
+def sub_block_minutes(dag: DAG, block: frozenset[str], cm: CostModel) -> float:
+    """A subagent's working duration for this block, beyond its first call."""
+    return _interpolate(cm.sub_block_minutes_curve, _units(dag, block))
 
 
 _block_minutes = block_minutes
@@ -624,7 +679,7 @@ def _simulate(dag: DAG, plan: Plan, cm: CostModel, order: tuple[int, ...]) -> fl
             concurrent = 1 + sum(
                 1 for i, f in sub_finish.items() if launched[i] <= lead < f
             )
-            sub_finish[b] = lead + _block_minutes(dag, plan.blocks[b], cm) * throughput_penalty(
+            sub_finish[b] = lead + sub_block_minutes(dag, plan.blocks[b], cm) * throughput_penalty(
                 cm, concurrent
             )
             unbriefed.discard(b)
@@ -663,7 +718,7 @@ def evaluate(dag: DAG, plan: Plan, cm: CostModel) -> PlanResult:
             cm.spawn_fixed_dollars
             + cm.brief_dollars_per_node * len(b)
             + cm.absorb_dollars_per_node * len(b)
-            + _block_dollars(dag, b, cm)
+            + sub_block_dollars(dag, b, cm)
         )
 
     orders = permutations(range(plan.k)) if plan.k <= 6 else [tuple(range(plan.k))]
@@ -687,7 +742,9 @@ def pareto_front(results: list[PlanResult]) -> list[PlanResult]:
     return out
 
 
-def is_tier_a(results: list[PlanResult], tol: float = OUTCOME_TOL) -> bool:
+def is_tier_a(
+    results: list[PlanResult], tol: float = OUTCOME_TOL, tol_latency: float | None = None
+) -> bool:
     """Tier A: one (cost, latency) OUTCOME dominates everything, so the same plan
     is optimal at every persona (section 5.1).
 
@@ -698,16 +755,26 @@ def is_tier_a(results: list[PlanResult], tol: float = OUTCOME_TOL) -> bool:
     reject essentially every wide-independent scenario from Tier A, which is
     precisely where Tier A is supposed to live.
 
-    `tol` should be set from section 5.1's materiality floor, not left at 1e-9:
-    these are floats derived from measured constants that carry CIs, and exact
-    equality is not a meaningful test.
+    `tol` gates the COST axis in dollars and `tol_latency` the LATENCY axis in
+    minutes -- two units, two tolerances, both set from the calibration's
+    materiality floors rather than left at 1e-9: these are floats derived from
+    measured constants that carry CIs, and exact equality is not a meaningful
+    test. `tol_latency` defaults to `tol` for callers predating the split.
     """
-    vals = {(round(r.cost / tol), round(r.latency / tol)) for r in pareto_front(results)}
+    tl = tol if tol_latency is None else tol_latency
+    vals = {(round(r.cost / tol), round(r.latency / tl)) for r in pareto_front(results)}
     return len(vals) == 1
 
 
-def optimal_k_intervals(results: list[PlanResult]) -> list[tuple[float, float, int]]:
+def optimal_k_intervals(
+    results: list[PlanResult], tol: float = OUTCOME_TOL, minute_tol: float = 0.0
+) -> list[tuple[float, float, int]]:
     """For which beta is each spawn count k optimal? Returns (lo, hi, k), sorted.
+
+    `tol` (dollars) and `minute_tol` (minutes) come from the calibration's
+    materiality floors; the tie-break tolerance at a probe beta is
+    `tol + probe * minute_tol`, matching the objective's own units at that
+    beta. The defaults reproduce the old exact-equality behaviour.
 
     The intervals partition [0, inf): the first starts at 0.0 and the last ends
     at `math.inf`, because past the largest breakpoint the argmin cannot change
@@ -761,7 +828,7 @@ def optimal_k_intervals(results: list[PlanResult]) -> list[tuple[float, float, i
         # estimator toward the finding this project is trying to test.
         scored = [(L[0] + probe * L[1], L[2]) for L in lines]
         floor = min(s for s, _ in scored)
-        k = min(kk for s, kk in scored if s <= floor + OUTCOME_TOL)
+        k = min(kk for s, kk in scored if s <= floor + tol + probe * minute_tol)
         if out and out[-1][2] == k:
             out[-1] = (out[-1][0], hi, k)
         else:

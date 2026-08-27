@@ -41,6 +41,8 @@ __all__ = [
     "TimingModel",
     "fit_timing_model",
     "call_minutes",
+    "fresh_tokens",
+    "context_tokens",
     "holdout_error",
 ]
 
@@ -128,14 +130,34 @@ def average_curves(curves: list[tuple[tuple[int, float], ...]]) -> tuple[tuple[i
     Repeats are not optional. A single run is one draw from a stochastic policy,
     and a curve fitted to one draw reports that draw's turn count as if it were
     a property of the model.
+
+    FORCED ORDERINGS MISALIGN THE BUCKETS (found by the first preflight that
+    actually varied them): a run that starts with a size-5 node has no point at
+    3 units, so bucketing by raw unit count averages each bucket over whichever
+    runs happen to land on it -- and the mean curve came out NON-MONOTONE,
+    pricing a 5-unit block below a 3-unit one purely as a coverage artifact.
+    So each curve is read on the union grid via interpolation, a grid point
+    averages only the curves whose MEASURED range covers it (no extrapolating a
+    run beyond what it did, no pro-rata modelling below its first point), and
+    the result is clamped monotone with a running max -- every run's own
+    cumulative curve is monotone, so an inversion in the average is never a
+    measurement.
     """
-    if not curves:
+    from generator.oracle import _interpolate
+
+    usable = [tuple(sorted(c)) for c in curves if c]
+    if not usable:
         raise ValueError("no curves to average")
-    buckets: dict[int, list[float]] = {}
-    for curve in curves:
-        for units, value in curve:
-            buckets.setdefault(units, []).append(value)
-    return tuple((u, sum(vs) / len(vs)) for u, vs in sorted(buckets.items()))
+    grid = sorted({u for c in usable for u, _ in c})
+    out: list[tuple[int, float]] = []
+    floor = 0.0
+    for u in grid:
+        vals = [_interpolate(c, u) for c in usable if c[0][0] <= u <= c[-1][0]]
+        if not vals:
+            continue
+        floor = max(floor, sum(vals) / len(vals))
+        out.append((u, floor))
+    return tuple(out)
 
 
 def curve_disagreement(curves: list[tuple[tuple[int, float], ...]]) -> dict[int, float]:
@@ -163,9 +185,43 @@ def curve_disagreement(curves: list[tuple[tuple[int, float], ...]]) -> dict[int,
 # --------------------------------------------------------- the timing model
 
 
+def fresh_tokens(call: CallRecord) -> int:
+    """Context the provider prefills at full price: uncached input plus cache
+    writes. Cache reads are prefilled too, but on their own terms -- see
+    `context_tokens` and the correction note on `TimingModel`."""
+    return (call.input_tokens or 0) + (call.cache_write_tokens or 0)
+
+
+def context_tokens(call: CallRecord) -> int:
+    """The full prompt the model read: billed input + cache writes + cache reads.
+
+    Billed `input_tokens` alone is NOT context size. Under the pinned cache
+    breakpoints nearly the whole prompt bills as cache reads and writes, and
+    billed input collapses to the residue after the last breakpoint -- measured
+    at a constant 2 tokens per call across the first real calibration. Any code
+    that means "how much did this call read" must use this sum, never the raw
+    field.
+    """
+    return fresh_tokens(call) + (call.cache_read_tokens or 0)
+
+
 @dataclass(frozen=True)
 class TimingModel:
-    """`minutes = a + b * input_tokens + output_tokens / throughput`.
+    """`minutes = a + b_fresh * fresh + b_cached * cache_reads + output / throughput`.
+
+    `fresh` is uncached input plus cache writes -- tokens prefilled at full
+    price. Cache reads are prefilled too, but faster; they carry their own
+    coefficient when the log can identify one, and `b_cached = None` records a
+    blended fit where a single coefficient covered every context token.
+
+    THE REGRESSORS ARE CONTEXT COLUMNS, NOT BILLED `input_tokens` (corrected
+    Aug 25). Under the pinned cache breakpoints billed input is a near-constant
+    residue -- 2 tokens on every call of the first real calibration -- so a fit
+    against it was singular while the context actually varied by tens of
+    thousands of tokens. Where such a fit DID succeed (the Haiku preflight,
+    whose higher cache floor left tail segments uncached), it priced prefill on
+    that sliver and read 470K cache-read tokens as free: numerically plausible,
+    physically wrong.
 
     Latency for the metric is reconstructed from this, never taken from the
     clock. Wall clock is confounded by rate limits, queueing, and provider load,
@@ -174,14 +230,22 @@ class TimingModel:
     """
 
     a_minutes: float
-    b_minutes_per_input_token: float
+    b_minutes_per_input_token: float  # minutes per FRESH context token
     output_tokens_per_minute: float
+    b_cached_minutes_per_token: float | None = None  # per cache-read token; None = blended
     n_calls: int = 0
     residual_rms_minutes: float = 0.0
 
+    @property
+    def cached_minutes_per_token(self) -> float:
+        """The cache-read coefficient, falling back to the fresh one for a
+        blended fit -- so downstream consumers never branch."""
+        b = self.b_cached_minutes_per_token
+        return self.b_minutes_per_input_token if b is None else b
 
-def _solve3(m: list[list[float]], rhs: list[float]) -> list[float]:
-    """Gaussian elimination with partial pivoting. Three unknowns, no numpy."""
+
+def _solve(m: list[list[float]], rhs: list[float]) -> list[float]:
+    """Gaussian elimination with partial pivoting. Any number of unknowns, no numpy."""
     n = len(rhs)
     aug = [row[:] + [rhs[i]] for i, row in enumerate(m)]
     for col in range(n):
@@ -198,23 +262,59 @@ def _solve3(m: list[list[float]], rhs: list[float]) -> list[float]:
     return [aug[i][n] / aug[i][i] for i in range(n)]
 
 
-def fit_timing_model(calls: list[CallRecord]) -> TimingModel:
-    """Least squares over the call log for the three timing constants.
+def _fit(xs: list[tuple], ys: list[float]) -> tuple[list[float], float]:
+    """Normal-equations least squares plus the residual RMS of the fit."""
+    k = len(xs[0])
+    m = [[sum(x[i] * x[j] for x in xs) for j in range(k)] for i in range(k)]
+    rhs = [sum(x[i] * y for x, y in zip(xs, ys)) for i in range(k)]
+    coef = _solve(m, rhs)
+    resid = [sum(c * xi for c, xi in zip(coef, x)) - y for x, y in zip(xs, ys)]
+    return coef, (sum(r * r for r in resid) / len(resid)) ** 0.5
 
-    Fitted against `total_s`, with `input_tokens` and `output_tokens` as the
-    regressors. Time-to-first-byte is what makes the input term real: prefill
-    scales with context length, so a large lead context is materially slower to
-    START than a cold subagent -- which is why context drag lands in the latency
-    column and not only in the cost column.
+
+def fit_timing_model(calls: list[CallRecord]) -> TimingModel:
+    """Least squares over the call log for the timing constants.
+
+    Fitted against `total_s`, with CONTEXT columns and `output_tokens` as the
+    regressors -- context, never billed `input_tokens`, per the correction on
+    `TimingModel`. Time-to-first-byte is what makes the context term real:
+    prefill scales with what the model reads, so a large lead context is
+    materially slower to START than a cold subagent -- which is why context
+    drag lands in the latency column and not only in the cost column.
+
+    The fit is tried SPLIT first (separate fresh and cache-read coefficients),
+    because the serial and fan-out arms differ systematically in cache mix and
+    one blended coefficient would misprice exactly the serial-vs-parallel
+    comparison. It falls back to blended when the log cannot tell the two
+    apart: a singular system, a wrong-signed coefficient, or cached prefill
+    fitting SLOWER than fresh -- physically backwards, so the split is noise
+    there. The blended fit reports its own refusals.
     """
     rows = [c for c in calls if c.billable and c.total_s > 0]
     if len(rows) < 3:
         raise ValueError(f"need at least 3 timed calls to fit three constants, got {len(rows)}")
-    xs = [(1.0, float(c.input_tokens or 0), float(c.output_tokens or 0)) for c in rows]
     ys = [c.total_s / 60.0 for c in rows]
-    m = [[sum(x[i] * x[j] for x in xs) for j in range(3)] for i in range(3)]
-    rhs = [sum(x[i] * y for x, y in zip(xs, ys)) for i in range(3)]
-    a, b, c_out = _solve3(m, rhs)
+    fresh = [float(fresh_tokens(c)) for c in rows]
+    cached = [float(c.cache_read_tokens or 0) for c in rows]
+    outs = [float(c.output_tokens or 0) for c in rows]
+
+    if len(rows) >= 4 and len(set(cached)) >= 2:
+        try:
+            coef, rms = _fit([(1.0, f, cr, o) for f, cr, o in zip(fresh, cached, outs)], ys)
+            a, b_f, b_c, c_split = coef
+            if b_f >= 0.0 and 0.0 <= b_c <= b_f and c_split > 0.0:
+                return TimingModel(
+                    a_minutes=a,
+                    b_minutes_per_input_token=b_f,
+                    output_tokens_per_minute=1.0 / c_split,
+                    b_cached_minutes_per_token=b_c,
+                    n_calls=len(rows),
+                    residual_rms_minutes=rms,
+                )
+        except ValueError:
+            pass  # singular split; the blended fit below speaks for itself
+
+    (a, b, c_out), rms = _fit([(1.0, f + cr, o) for f, cr, o in zip(fresh, cached, outs)], ys)
     if c_out <= 0:
         raise ValueError(
             "fitted a non-positive cost per output token; the log is too narrow to "
@@ -229,19 +329,17 @@ def fit_timing_model(calls: list[CallRecord]) -> TimingModel:
         # absorption minutes are derived from it, and they would come out
         # negative too, making every absorbed result shorten the run.
         #
-        # It happens when input length does not vary independently of output
+        # It happens when context size does not vary independently of output
         # length across the log, so the regression cannot separate the two. The
         # answer is more varied calls, not a clamp: clamping to zero would assert
         # prefill is free, which is the same unmeasured claim in the other
         # direction.
         raise ValueError(
             f"fitted a negative cost per input token ({b:.3g} min/token), which would make "
-            "a larger context faster to start. Input and output length are too correlated "
+            "a larger context faster to start. Context and output length are too correlated "
             "in this log to separate prefill from generation -- vary them independently "
             "across the calibration calls"
         )
-    resid = [(a + b * x[1] + c_out * x[2]) - y for x, y in zip(xs, ys)]
-    rms = (sum(r * r for r in resid) / len(resid)) ** 0.5
     return TimingModel(
         a_minutes=a,
         b_minutes_per_input_token=b,
@@ -252,10 +350,17 @@ def fit_timing_model(calls: list[CallRecord]) -> TimingModel:
 
 
 def call_minutes(call: CallRecord, tm: TimingModel) -> float:
-    """Analytic duration for one call. Not `call.total_s`."""
+    """Analytic duration for one call. Not `call.total_s`.
+
+    Prices the context the model READ: fresh tokens at the fresh coefficient,
+    cache reads at the cached one (identical under a blended fit). Reading
+    billed `input_tokens` here was the Aug 25 correction -- it silently priced
+    a 100K-token warm context as two tokens of prefill.
+    """
     return (
         tm.a_minutes
-        + tm.b_minutes_per_input_token * (call.input_tokens or 0)
+        + tm.b_minutes_per_input_token * fresh_tokens(call)
+        + tm.cached_minutes_per_token * (call.cache_read_tokens or 0)
         + (call.output_tokens or 0) / tm.output_tokens_per_minute
     )
 

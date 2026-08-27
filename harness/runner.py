@@ -248,12 +248,21 @@ USER_PROMPT = (
 )
 
 
-def describe_plan(scenario: Scenario, plan: Plan, order: tuple[int, ...] | None = None) -> str:
+def describe_plan(
+    scenario: Scenario,
+    plan: Plan,
+    order: tuple[int, ...] | None = None,
+    node_order: tuple[str, ...] | None = None,
+) -> str:
     """The plan directive appended to a forced run's prompt.
 
     Written as an instruction rather than as machinery, for the reason in the
     module docstring: the lead has to emit the briefings itself or the baseline
     under-counts delegation overhead.
+
+    `node_order` fixes the order the lead works its OWN nodes in. Calibration
+    needs it: the block-curve check compares runs across node orderings, and an
+    "ordering" the model chose for itself is the same ordering every time.
     """
     blocks = list(plan.blocks)
     if order:
@@ -267,9 +276,17 @@ def describe_plan(scenario: Scenario, plan: Plan, order: tuple[int, ...] | None 
         "",
     ]
     inline = sorted(plan.inline)
-    lines.append(
-        f"- Do these yourself, without delegating: {', '.join(inline) if inline else '(none)'}"
-    )
+    if node_order and inline:
+        ordered = [n for n in node_order if n in plan.inline]
+        ordered += [n for n in inline if n not in ordered]  # never drop a node
+        lines.append(
+            "- Do these yourself, without delegating, finishing them one at a time "
+            f"in exactly this order: {', '.join(ordered)}"
+        )
+    else:
+        lines.append(
+            f"- Do these yourself, without delegating: {', '.join(inline) if inline else '(none)'}"
+        )
     if blocks:
         lines.append(
             f"- Issue exactly {len(blocks)} spawn_subagent call(s), in this order, "
@@ -588,6 +605,7 @@ def run_plan(
     root: str | Path,
     *,
     order: tuple[int, ...] | None = None,
+    node_order: tuple[str, ...] | None = None,
     disclose_dag: bool = False,
     max_turns: int = 40,
     condition: str = "oracle-plan",
@@ -612,7 +630,7 @@ def run_plan(
         max_turns=max_turns,
         condition=condition,
         repeat=repeat,
-        directive=describe_plan(scenario, plan, order),
+        directive=describe_plan(scenario, plan, order, node_order),
         budget=budget,
         retry=retry,
         proxy_log=proxy_log,
