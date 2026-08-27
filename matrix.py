@@ -42,8 +42,7 @@ from pathlib import Path
 from generator.manifest import ScenarioSpec
 from generator.oracle import Plan, all_inline, max_fanout
 from harness.calibrate import PriceSheet
-from harness.cli import ANTHROPIC_API, HARNESS_SPEC, price_sheet
-from harness.client import AnthropicClient
+from harness.cli import ANTHROPIC_API, client_for_model, endpoint_defaults, price_sheet
 from harness.runner import Budget, run_agent, run_plan
 
 # ----------------------------------------------------------------- constants
@@ -286,15 +285,13 @@ def main(argv=None) -> int:
         return 0
 
     import os
-    key = os.environ.get(args.api_key_env, "")
+    # The provider dispatch lives in harness.cli so this entry point cannot
+    # drift from the others; untouched Anthropic defaults re-route for gpt-*.
+    base_url, key_env = endpoint_defaults(price.model, args.base_url, args.api_key_env)
+    key = os.environ.get(key_env, "")
     if not key:
-        raise SystemExit(f"{args.api_key_env} is not set.")
-    spec_h = HARNESS_SPEC[price.model]
-    client = AnthropicClient(
-        model=price.model, api_key=key, base_url=args.base_url,
-        max_tokens=args.max_tokens, timeout=args.timeout,
-        thinking=spec_h["thinking"], effort=spec_h["effort"], cache_ttl=spec_h["cache_ttl"],
-    )
+        raise SystemExit(f"{key_env} is not set.")
+    client = client_for_model(price.model, key, base_url, args.max_tokens, args.timeout)
     out.mkdir(parents=True, exist_ok=True)
 
     directive = {"stated-b1": DIRECTIVE_B1, "stated-b0": DIRECTIVE_B0}.get(cell["cond"], "")

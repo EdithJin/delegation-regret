@@ -22,7 +22,7 @@ from pathlib import Path
 from generator.manifest import CORE, load as load_manifest
 from harness.calibrate import PriceSheet
 from harness.calibration import CalibrationResult
-from harness.cli import PRICE_SHEETS, calibration_scenario, main, price_sheet
+from harness.cli import PRICE_SHEETS, calibration_scenario, main, price_sheet, provider_for
 
 
 def run_cli(*argv: str) -> tuple[int, str]:
@@ -38,8 +38,15 @@ class TestPriceSheets(unittest.TestCase):
             self.assertIsInstance(sheet, PriceSheet)
             date.fromisoformat(sheet.as_of)  # raises if undated or malformed
             for rate in (sheet.input_per_mtok, sheet.output_per_mtok,
-                         sheet.cache_read_per_mtok, sheet.cache_write_per_mtok):
+                         sheet.cache_read_per_mtok):
                 self.assertGreater(rate, 0.0, key)
+            # The write rate is provider-shaped: Anthropic sells cache writes
+            # at a TTL premium, OpenAI writes are automatic and unbilled -- a
+            # zero there is the entered price, not an unfilled field.
+            if provider_for(sheet.model) == "openai":
+                self.assertEqual(sheet.cache_write_per_mtok, 0.0, key)
+            else:
+                self.assertGreater(sheet.cache_write_per_mtok, 0.0, key)
 
     def test_registry_key_names_the_model_it_prices(self) -> None:
         # "claude-sonnet-5@list" prices claude-sonnet-5; every key is the model
@@ -49,14 +56,21 @@ class TestPriceSheets(unittest.TestCase):
             self.assertEqual(key.split("@")[0], sheet.model, key)
 
     def test_cache_pricing_carries_the_pinned_ttl_premium(self) -> None:
-        # Reads at 0.1x input, writes at the 2x one-hour-TTL premium. If the
-        # pinned TTL ever changes to 5 minutes, the write premium is 1.25x and
-        # this test is the reminder that the sheets must change with it.
+        # Reads at 0.1x input on both providers. Writes are Anthropic-only: the
+        # 2x premium is the one-hour TTL the harness pins -- if that pin ever
+        # changes to 5 minutes, the premium is 1.25x and this test is the
+        # reminder that the sheets must change with it. The OpenAI sheets carry
+        # no write premium at all, because there is no TTL to buy: caching is
+        # automatic, unbilled on write, and unpinnable (the comparability
+        # caveat lives on the HARNESS_SPEC entry).
         for key, sheet in PRICE_SHEETS.items():
             self.assertAlmostEqual(sheet.cache_read_per_mtok, 0.1 * sheet.input_per_mtok,
                                    places=6, msg=key)
-            self.assertAlmostEqual(sheet.cache_write_per_mtok, 2.0 * sheet.input_per_mtok,
-                                   places=6, msg=key)
+            if provider_for(sheet.model) == "openai":
+                self.assertEqual(sheet.cache_write_per_mtok, 0.0, key)
+            else:
+                self.assertAlmostEqual(sheet.cache_write_per_mtok, 2.0 * sheet.input_per_mtok,
+                                       places=6, msg=key)
 
     def test_unknown_model_is_refused_with_the_roster(self) -> None:
         with self.assertRaises(SystemExit) as ctx:

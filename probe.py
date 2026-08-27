@@ -33,8 +33,7 @@ from generator.manifest import ScenarioSpec
 from generator.oracle import all_inline, evaluate, max_fanout
 from harness.calibrate import PriceSheet, TimingModel
 from harness.calibration import CalibrationResult
-from harness.cli import ANTHROPIC_API, HARNESS_SPEC, price_sheet
-from harness.client import AnthropicClient
+from harness.cli import ANTHROPIC_API, client_for_model, endpoint_defaults, price_sheet
 from harness.runner import Budget, run_plan
 
 
@@ -112,15 +111,13 @@ def main(argv=None) -> int:
         print("  dry run: no key, no spend.")
         return 0
 
-    key = os.environ.get(args.api_key_env, "")
+    # The provider dispatch lives in harness.cli so this entry point cannot
+    # drift from the others; untouched Anthropic defaults re-route for gpt-*.
+    base_url, key_env = endpoint_defaults(price.model, args.base_url, args.api_key_env)
+    key = os.environ.get(key_env, "")
     if not key:
-        raise SystemExit(f"{args.api_key_env} is not set.")
-    spec = HARNESS_SPEC[price.model]
-    client = AnthropicClient(
-        model=price.model, api_key=key, base_url=args.base_url,
-        max_tokens=args.max_tokens, timeout=args.timeout,
-        thinking=spec["thinking"], effort=spec["effort"], cache_ttl=spec["cache_ttl"],
-    )
+        raise SystemExit(f"{key_env} is not set.")
+    client = client_for_model(price.model, key, base_url, args.max_tokens, args.timeout)
 
     out.mkdir(parents=True, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]

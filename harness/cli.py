@@ -38,11 +38,14 @@ upstream. `--base-url` exists so tests can point the same code at
 `ProtocolUpstream`; the default is the real endpoint, and the runner routes
 every call through the logging proxy on its own.
 
-The OpenAI wire format has no entry here on purpose: the open-weights leg was
-dropped on Aug 24 (TASKS-AND-OPEN-ISSUES.md section 3) after its go/no-go
-deadline passed unmet. When it returns, it needs an `OpenAIClient` branch and a
-provider-pinned price sheet -- the price vector is provider-specific, not
-model-specific.
+The OpenAI leg landed 2026-08-27 (it was dropped Aug 24 when its go/no-go
+deadline passed unmet; TASKS-AND-OPEN-ISSUES.md section 3): gpt-* models carry
+their own provider-pinned price sheets below -- the price vector is
+provider-specific, not model-specific -- and `build_client` dispatches them to
+`OpenAIClient` via `provider_for`. When a gpt model is selected and --base-url
+/ --api-key-env are left at their Anthropic defaults, `endpoint_defaults`
+re-routes them to https://api.openai.com and OPENAI_API_KEY; explicit flags
+always win, which is how tests point a gpt model at a local fake.
 """
 
 from __future__ import annotations
@@ -64,11 +67,12 @@ from generator.scenario import Scenario, build_scenario
 from .audit import audit_summary, eps_from_calibration, run_audit
 from .calibrate import PriceSheet, TimingModel
 from .calibration import CalibrationResult, replay, run_calibration
-from .client import AnthropicClient
+from .client import AnthropicClient, Client, OpenAIClient
 from .experiment import run_experiment
 from .runner import Budget
 
 ANTHROPIC_API = "https://api.anthropic.com"
+OPENAI_API = "https://api.openai.com"
 
 # Dollars per million tokens, from the vendor's published rates, checked
 # 2026-08-24. Cache reads are 0.1x input; cache writes carry the 2x premium of
@@ -112,6 +116,24 @@ PRICE_SHEETS: dict[str, PriceSheet] = {
         input_per_mtok=1.00, output_per_mtok=5.00,
         cache_read_per_mtok=0.10, cache_write_per_mtok=2.00,
     ),
+    # gpt-5.6-sol is the OpenAI comparator leg, on promotional pricing through
+    # 2026-11-21 (rates checked 2026-08-27). The promo sheet is the default
+    # because every planned run lands inside the window; "@list" exists so any
+    # absolute dollar figure can be restated at list rates, the same discipline
+    # claude-sonnet-5 follows. Cached input bills at 0.1x like everywhere else,
+    # but the cache-WRITE rate is a true zero, not a missing number: OpenAI
+    # prompt caching is automatic and charges nothing to write, so there is no
+    # premium to enter -- and correspondingly no TTL to pin (see HARNESS_SPEC).
+    "gpt-5.6-sol": PriceSheet(
+        model="gpt-5.6-sol", as_of="2026-08-27",
+        input_per_mtok=4.00, output_per_mtok=20.00,
+        cache_read_per_mtok=0.40, cache_write_per_mtok=0.00,
+    ),
+    "gpt-5.6-sol@list": PriceSheet(
+        model="gpt-5.6-sol", as_of="2026-08-27",
+        input_per_mtok=5.00, output_per_mtok=30.00,
+        cache_read_per_mtok=0.50, cache_write_per_mtok=0.00,
+    ),
 }
 
 
@@ -134,6 +156,18 @@ HARNESS_SPEC: dict[str, dict] = {
     "claude-opus-5": {"thinking": {"type": "adaptive"}, "effort": "high", "cache_ttl": "1h"},
     "claude-sonnet-5": {"thinking": {"type": "adaptive"}, "effort": "high", "cache_ttl": "1h"},
     "claude-haiku-4-5": {"thinking": None, "effort": None, "cache_ttl": "1h"},
+    # The OpenAI leg's spec deliberately has NO thinking key (an Anthropic-only
+    # parameter; effort maps to reasoning_effort on this wire format) and NO
+    # cache_ttl: OpenAI prompt caching is automatic -- unbilled on write, with
+    # provider-managed retention that cannot be purchased or pinned.
+    # COMPARABILITY CAVEAT, to be published with any cross-provider table: the
+    # Anthropic legs run under a pinned one-hour TTL while this leg's cache
+    # lifetime floats at the provider's discretion, so cache-hit rates (and the
+    # realized costs downstream of them) are not measured under the same
+    # retention discipline. max_tokens 16000 matches the --max-tokens default
+    # every leg runs under, recorded here so this leg's constants are greppable
+    # in one place like the others.
+    "gpt-5.6-sol": {"max_tokens": 16000, "effort": "high"},
 }
 
 
@@ -149,26 +183,69 @@ def price_sheet(key: str) -> PriceSheet:
         )
 
 
-def build_client(args, price: PriceSheet) -> AnthropicClient:
-    key = os.environ.get(args.api_key_env, "")
-    if not key:
-        raise SystemExit(
-            f"{args.api_key_env} is not set. Export it, or name another "
-            "variable with --api-key-env. There is no keyless mode against a "
-            "real endpoint; for a keyless dry run, point --base-url at a "
-            "ProtocolUpstream the way tests/test_cli.py does."
+def provider_for(model: str) -> str:
+    """Which wire format a pinned model speaks: "openai" for gpt-*, otherwise
+    "anthropic". The prefix is the dispatch rule on purpose -- a new gpt model
+    needs only its sheets and spec entered above, not a new branch."""
+    return "openai" if model.startswith("gpt-") else "anthropic"
+
+
+def endpoint_defaults(model: str, base_url: str, api_key_env: str) -> tuple[str, str]:
+    """Re-route the two Anthropic-shaped defaults when the model is OpenAI's.
+
+    Only the untouched defaults move: an explicit --base-url or --api-key-env
+    always wins, which is both how tests point a gpt model at a local fake and
+    how a real run reaches an OpenAI-compatible open-source endpoint.
+    """
+    if provider_for(model) == "openai":
+        if base_url == ANTHROPIC_API:
+            base_url = OPENAI_API
+        if api_key_env == "ANTHROPIC_API_KEY":
+            api_key_env = "OPENAI_API_KEY"
+    return base_url, api_key_env
+
+
+def client_for_model(model: str, api_key: str, base_url: str,
+                     max_tokens: int, timeout: float) -> Client:
+    """The provider dispatch: the ONE place a pinned model becomes a client.
+
+    probe.py and matrix.py construct clients through here too, so the mapping
+    from model to wire format -- and to its pinned harness spec -- cannot drift
+    between entry points.
+    """
+    spec = HARNESS_SPEC[model]
+    if provider_for(model) == "openai":
+        return OpenAIClient(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            effort=spec["effort"],
         )
-    spec = HARNESS_SPEC[price.model]
     return AnthropicClient(
-        model=price.model,
-        api_key=key,
-        base_url=args.base_url,
-        max_tokens=args.max_tokens,
-        timeout=args.timeout,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        max_tokens=max_tokens,
+        timeout=timeout,
         thinking=spec["thinking"],
         effort=spec["effort"],
         cache_ttl=spec["cache_ttl"],
     )
+
+
+def build_client(args, price: PriceSheet) -> Client:
+    base_url, key_env = endpoint_defaults(price.model, args.base_url, args.api_key_env)
+    key = os.environ.get(key_env, "")
+    if not key:
+        raise SystemExit(
+            f"{key_env} is not set. Export it, or name another "
+            "variable with --api-key-env. There is no keyless mode against a "
+            "real endpoint; for a keyless dry run, point --base-url at a "
+            "ProtocolUpstream the way tests/test_cli.py does."
+        )
+    return client_for_model(price.model, key, base_url, args.max_tokens, args.timeout)
 
 
 def calibration_scenario(args) -> Scenario:
@@ -211,11 +288,17 @@ def cmd_models(args) -> int:
         )
     print("\n  claude-sonnet-5 is the introductory sheet, valid through 2026-08-31;")
     print("  claude-sonnet-5@list restates the same model at list rates.")
+    print("  gpt-5.6-sol is the promotional sheet, valid through 2026-11-21;")
+    print("  gpt-5.6-sol@list restates it at list rates. Its cache-write rate is a")
+    print("  true zero: OpenAI caching is automatic, unbilled on write, TTL unpinnable")
+    print("  (cross-provider cache-hit rates are therefore not TTL-comparable).")
     print("\n  harness spec, pinned 2026-08-24 (published constants):")
     print("    max_tokens 16000 | thinking adaptive | effort high | cache TTL 1h")
     print("    fan-out unstaggered | concurrency cap 4 (tools.MAX_CONCURRENCY)")
     print("    claude-haiku-4-5 (plumbing only) predates adaptive thinking and")
     print("    effort; its spec sends neither.")
+    print("    gpt-5.6-sol (OpenAI leg, added 2026-08-27): max_tokens 16000,")
+    print("    reasoning_effort high; no thinking, no cache TTL (caching automatic).")
     return 0
 
 
