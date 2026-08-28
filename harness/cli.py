@@ -167,7 +167,13 @@ HARNESS_SPEC: dict[str, dict] = {
     # retention discipline. max_tokens 16000 matches the --max-tokens default
     # every leg runs under, recorded here so this leg's constants are greppable
     # in one place like the others.
-    "gpt-5.6-sol": {"max_tokens": 16000, "effort": "high"},
+    # effort "none" is REQUIRED, not chosen: the real endpoint 400s function
+    # tools on /v1/chat/completions unless reasoning_effort is explicitly
+    # "none" (verified live 2026-08-27; the default is non-none, so omitting
+    # the field also 400s). Comparability caveat: the opus leg runs effort
+    # "high" — this leg measures gpt-5.6-sol's no-reasoning tool mode. The
+    # reasoning-ON leg requires the /v1/responses wire format (October queue).
+    "gpt-5.6-sol": {"max_tokens": 16000, "effort": "none"},
 }
 
 
@@ -298,7 +304,9 @@ def cmd_models(args) -> int:
     print("    claude-haiku-4-5 (plumbing only) predates adaptive thinking and")
     print("    effort; its spec sends neither.")
     print("    gpt-5.6-sol (OpenAI leg, added 2026-08-27): max_tokens 16000,")
-    print("    reasoning_effort high; no thinking, no cache TTL (caching automatic).")
+    print("    reasoning_effort none — REQUIRED for tools on chat completions")
+    print("    (verified live; reasoning-on needs /v1/responses, October);")
+    print("    no thinking, no cache TTL (caching automatic).")
     return 0
 
 

@@ -271,7 +271,10 @@ class TestProviderDispatch(unittest.TestCase):
             client = build_client(self._args(), PRICE_SHEETS["gpt-5.6-sol"])
         self.assertIsInstance(client, OpenAIClient)
         self.assertEqual(client.model, "gpt-5.6-sol")
-        self.assertEqual(client.effort, "high")
+        # "none" is REQUIRED by the live endpoint: function tools on chat
+        # completions 400 unless reasoning_effort is explicitly "none"
+        # (verified 2026-08-27; reasoning-on needs /v1/responses).
+        self.assertEqual(client.effort, "none")
         self.assertEqual(client.max_tokens, 16000)
 
     def test_the_list_sheet_prices_the_same_client(self) -> None:
@@ -315,7 +318,7 @@ class TestProviderDispatch(unittest.TestCase):
         # under; thinking and cache_ttl are deliberately absent -- there is no
         # TTL to pin on automatic caching, which is the published
         # comparability caveat on the HARNESS_SPEC entry.
-        self.assertEqual(HARNESS_SPEC["gpt-5.6-sol"], {"max_tokens": 16000, "effort": "high"})
+        self.assertEqual(HARNESS_SPEC["gpt-5.6-sol"], {"max_tokens": 16000, "effort": "none"})
 
     def test_the_promotional_sheet_is_dated_inside_its_window(self) -> None:
         promo, lst = PRICE_SHEETS["gpt-5.6-sol"], PRICE_SHEETS["gpt-5.6-sol@list"]
