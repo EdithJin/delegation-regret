@@ -47,6 +47,7 @@ __all__ = [
     "Client",
     "AnthropicClient",
     "OpenAIClient",
+    "OpenAIResponsesClient",
     "ScriptedClient",
     "ANTHROPIC_VERSION",
 ]
@@ -450,6 +451,202 @@ class OpenAIClient(Client):
     def append_tool_results(self, history: list, results: list[tuple[ToolRequest, str]]) -> None:
         for call, result in results:
             history.append({"role": "tool", "tool_call_id": call.id, "content": result})
+
+
+# ----------------------------------------------------------- OpenAI responses
+
+
+@dataclass
+class OpenAIResponsesClient(Client):
+    """api.openai.com's `POST /v1/responses` wire format, streaming.
+
+    This client exists because the chat-completions one CANNOT run the pinned
+    spec: gpt-5.6 rejects function tools on /v1/chat/completions unless
+    reasoning_effort is "none" (verified live 2026-08-27), and the error names
+    this API as the one that takes tools and reasoning together. So gpt-5.6-sol
+    dispatches here with effort "high" -- parity with the opus leg -- while
+    `OpenAIClient` stays intact for the OpenAI-compatible open-source servers,
+    which speak chat completions and nothing else.
+
+    STATELESS ON PURPOSE. The API can hold the conversation server-side
+    (`previous_response_id`), but the harness replays full history each turn and
+    runs subagent conversations independently, so this client never uses it:
+    every request carries `store: false` and the whole conversation in `input`.
+    That makes reasoning replay OUR job -- the API emits reasoning items ahead
+    of function calls and requires them back, verbatim, on the next turn, or it
+    rejects the function_call as orphaned. With no server-side store those items
+    are only replayable if they carry their content encrypted, which is what
+    `include: ["reasoning.encrypted_content"]` requests. `raw` is therefore the
+    turn's ENTIRE output-item list, replayed untouched; dropping the reasoning
+    items (or their encrypted payloads) passes a single-turn test and 400s the
+    first tool round trip -- the fake enforces the same rejection offline.
+
+    The stream's delta events pace the bytes (and hand `_post_sse` a real first
+    byte for ttfb); the turn itself is read off the terminal snapshot event
+    (`response.completed` / `.incomplete` / `.failed`), which carries the
+    response object -- output items, usage, status -- exactly as a buffered body
+    would. Reading the provider's own final record beats re-assembling it from
+    deltas: the counts must come from the provider (module docstring), and a
+    stream that dies before the snapshot yields zeros a test can see rather
+    than a plausible partial turn.
+
+    Usage lands in the Anthropic-convention currency the whole repo uses:
+    `input_tokens` arrives INCLUSIVE of cached tokens here (the same convention
+    as chat completions' prompt_tokens, under a different field name), so the
+    fresh count is the difference. `output_tokens` arrives INCLUSIVE of
+    reasoning tokens and is exactly what bills at the output rate, so it maps
+    across unchanged -- `output_tokens_details.reasoning_tokens` is a breakdown,
+    never an addend. Cache writes are automatic and unbilled: zero, as on the
+    chat leg.
+    """
+
+    model: str
+    api_key: str
+    base_url: str
+    max_tokens: int = 4096
+    timeout: float = 300.0
+    effort: str | None = None
+
+    def start(self, system: str, user: str, actor: str = "lead") -> list:
+        # The system prompt is the top-level `instructions` parameter, not an
+        # input item, so it rides with the history under a private key the API
+        # never sees -- same pattern (and same concurrency reason) as the
+        # Anthropic client.
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": user}],
+                "_system": system,
+            }
+        ]
+
+    @staticmethod
+    def _split(history: list) -> tuple[str, list]:
+        system = ""
+        items = []
+        for item in history:
+            if "_system" in item:
+                system = item["_system"]
+                item = {k: v for k, v in item.items() if k != "_system"}
+            items.append(item)
+        return system, items
+
+    def complete(self, history: list, allow: tuple[str, ...]) -> Reply:
+        system, items = self._split(history)
+        payload = {
+            "model": self.model,
+            "instructions": system,
+            "input": items,
+            "max_output_tokens": self.max_tokens,
+            # Tools are FLAT on this wire format -- name, description, and
+            # parameters at the top level. The chat-completions `function`
+            # envelope is rejected here, and vice versa.
+            "tools": [
+                {"type": "function", "name": n, "description": d, "parameters": s}
+                for n, d, s in _specs(allow)
+            ],
+            "tool_choice": "auto",
+            "stream": True,
+            # Statelessness and its price, together: store nothing server-side,
+            # and ask for reasoning items in replayable (encrypted) form. Sent
+            # unconditionally -- they are properties of this client, not of any
+            # one model's spec, and a reasoning-by-default model behind an
+            # effort-less config would otherwise break on its second turn.
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+        }
+        if self.effort is not None:
+            payload["reasoning"] = {"effort": self.effort}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        events, ttfb, total = _post_sse(
+            self.base_url.rstrip("/") + "/v1/responses", payload, headers, self.timeout
+        )
+
+        response: dict = {}
+        for event in events:
+            if event.get("type") in (
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            ):
+                response = event.get("response") or {}
+        output = response.get("output") or []
+
+        text_parts: list[str] = []
+        calls: list[ToolRequest] = []
+        for item in output:
+            kind = item.get("type")
+            if kind == "message":
+                text_parts += [
+                    part.get("text", "")
+                    for part in item.get("content") or []
+                    if part.get("type") == "output_text"
+                ]
+            elif kind == "function_call":
+                wire = item.get("arguments") or ""
+                try:
+                    arguments = parse_arguments(wire)
+                except ValueError:
+                    # Surfaced, not repaired -- same rule as the chat leg.
+                    arguments = {"__malformed__": wire[:200]}
+                # `call_id` is the handle a function_call_output must answer;
+                # the item's own `id` stays on the raw item for the replay.
+                calls.append(
+                    ToolRequest(
+                        id=item.get("call_id", ""),
+                        name=item.get("name", ""),
+                        arguments=arguments,
+                    )
+                )
+
+        # No finish_reason on this wire format: the response has a status, and
+        # tool calls are just output items. Mapped onto the chat leg's
+        # vocabulary so the two OpenAI legs land in one column downstream.
+        status = response.get("status") or ""
+        if status == "completed":
+            stop = "tool_calls" if calls else "stop"
+        elif status == "incomplete":
+            stop = (response.get("incomplete_details") or {}).get("reason") or "incomplete"
+        else:
+            stop = status
+
+        usage = response.get("usage") or {}
+        details = usage.get("input_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0)
+        inclusive = int(usage.get("input_tokens") or 0)
+        return Reply(
+            text="".join(text_parts),
+            tool_calls=tuple(calls),
+            input_tokens=max(inclusive - cached, 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            cache_read_tokens=cached,
+            cache_write_tokens=0,  # automatic and unbilled, as on the chat leg
+            stop_reason=stop,
+            total_s=total,
+            ttfb_s=ttfb,
+            # The whole item list, verbatim: reasoning items (with their
+            # encrypted content), the message, and function_call items whose
+            # `arguments` stay the wire string -- re-serializing a parse would
+            # launder a malformed emission, and dropping the reasoning items
+            # orphans every function call on the next request.
+            raw=list(output),
+        )
+
+    def append_assistant(self, history: list, reply: Reply) -> None:
+        history.extend(reply.raw or [])
+
+    def append_tool_results(self, history: list, results: list[tuple[ToolRequest, str]]) -> None:
+        # One function_call_output item per call, matched by call_id. The API
+        # matches by id rather than by position, which the runner leans on: a
+        # mixed turn executes plain tools before spawns, so results can arrive
+        # out of emission order.
+        for call, result in results:
+            history.append(
+                {"type": "function_call_output", "call_id": call.id, "output": result}
+            )
 
 
 # -------------------------------------------------------------------- testing

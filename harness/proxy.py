@@ -25,10 +25,11 @@ cannot be fitted from a single duration. Time-to-first-byte is the prefill term
 subagent, which is what puts context drag in the latency column and what the
 Tier-A crossover claim rests on.
 
-The proxy speaks both the Anthropic Messages API and the OpenAI chat-completions
-shape, streaming or not, because the third matrix leg is an open-weights model
-behind an OpenAI-compatible endpoint and it has to land in the same log as
-everything else or the cross-model table is not comparable.
+The proxy speaks the Anthropic Messages API, the OpenAI chat-completions shape,
+and the OpenAI responses shape (`/v1/responses` -- the wire format the gpt leg
+needs for tools with reasoning on), streaming or not, because every leg has to
+land in the same log as everything else or the cross-model table is not
+comparable.
 
 Bytes are relayed as they arrive. The proxy must not buffer a streamed response
 to inspect it, because doing so would fold the whole generation time into
@@ -97,10 +98,11 @@ class CallRecord:
 
 
 def _flavor_for_path(path: str) -> str | None:
-    """Which dialect a request path pins: the OpenAI leg posts to
-    /v1/chat/completions and the Anthropic legs to /v1/messages.
+    """Which dialect a request path pins: the OpenAI chat leg posts to
+    /v1/chat/completions, the responses leg to /v1/responses, and the
+    Anthropic legs to /v1/messages.
 
-    The path decides, not the payload shape, because the two dialects are not
+    The path decides, not the payload shape, because the dialects are not
     reliably distinguishable from a single frame: some OpenAI-compatible
     servers emit the final usage-only chunk WITHOUT a `choices` key, and a
     shape-sniffer reads that as Anthropic-ish and silently drops the one frame
@@ -109,9 +111,27 @@ def _flavor_for_path(path: str) -> str | None:
     """
     if "chat/completions" in path:
         return "openai"
+    if "/responses" in path:
+        return "responses"
     if "/messages" in path:
         return "anthropic"
     return None
+
+
+def _responses_stop_reason(response: dict) -> str | None:
+    """The responses API has a status, not a finish_reason; both the client and
+    this sniffer map it onto the chat leg's vocabulary with THIS same rule, so
+    the trace/proxy cross-check compares like with like."""
+    calls = any(
+        isinstance(i, dict) and i.get("type") == "function_call"
+        for i in response.get("output") or []
+    )
+    status = response.get("status")
+    if status == "completed":
+        return "tool_calls" if calls else "stop"
+    if status == "incomplete":
+        return (response.get("incomplete_details") or {}).get("reason") or "incomplete"
+    return status
 
 
 class UsageSniffer:
@@ -121,9 +141,9 @@ class UsageSniffer:
     payloads without a socket -- which is how the parsing gets verified before
     any real money is spent on a request that might parse wrong.
 
-    `flavor` pins which dialect to read ("anthropic" | "openai"), normally from
-    the request path via `_flavor_for_path`; None keeps the historical
-    sniff-by-shape behaviour.
+    `flavor` pins which dialect to read ("anthropic" | "openai" | "responses"),
+    normally from the request path via `_flavor_for_path`; None keeps the
+    historical sniff-by-shape behaviour.
     """
 
     def __init__(self, flavor: str | None = None) -> None:
@@ -173,6 +193,25 @@ class UsageSniffer:
             # its true billed value rather than leaving it "unreported".
             self.cache_write_tokens = 0
 
+    def _responses_usage(self, usage: dict) -> None:
+        # The responses API reports input_tokens INCLUSIVE of cached ones --
+        # chat completions' convention under Anthropic's field name. The record
+        # keeps the exclusive convention (see `_openai_usage`), so the fresh
+        # count is the difference. output_tokens arrives INCLUSIVE of reasoning
+        # tokens and is what bills at the output rate, so it maps unchanged:
+        # output_tokens_details.reasoning_tokens is a breakdown, not an addend.
+        details = usage.get("input_tokens_details") or {}
+        cached = details.get("cached_tokens")
+        if cached is not None:
+            self.cache_read_tokens = cached
+        if usage.get("input_tokens") is not None:
+            self.input_tokens = max(usage["input_tokens"] - (cached or 0), 0)
+        if usage.get("output_tokens") is not None:
+            self.output_tokens = usage["output_tokens"]
+        if self.cache_write_tokens is None:
+            # Automatic and unbilled on write, exactly as on the chat leg.
+            self.cache_write_tokens = 0
+
     def _note_tool(self, name: str | None) -> None:
         if name and name not in self.tools_invoked:
             self.tools_invoked.append(name)
@@ -191,12 +230,39 @@ class UsageSniffer:
             if choice.get("finish_reason"):
                 self.stop_reason = choice["finish_reason"]
 
+    def _responses_event(self, payload: dict) -> None:
+        """One responses-API streaming event. Tool names are noted off each
+        function_call item as it opens; everything billable is read off the
+        terminal snapshot (`response.completed` / `.incomplete` / `.failed`),
+        which carries the whole response object -- there is no separate
+        usage-only frame on this wire format."""
+        kind = payload.get("type") or ""
+        if kind == "response.output_item.added":
+            item = payload.get("item") or {}
+            if item.get("type") == "function_call":
+                self._note_tool(item.get("name"))
+        elif kind in ("response.completed", "response.incomplete", "response.failed"):
+            self._responses_snapshot(payload.get("response") or {})
+
+    def _responses_snapshot(self, response: dict) -> None:
+        """A complete response object -- the terminal streaming snapshot, or the
+        whole body of a non-streaming exchange."""
+        self.model = response.get("model") or self.model
+        for item in response.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                self._note_tool(item.get("name"))
+        if response.get("usage"):
+            self._responses_usage(response["usage"])
+        self.stop_reason = _responses_stop_reason(response) or self.stop_reason
+
     # -- entry points ----------------------------------------------------
 
     def feed_event(self, payload: dict) -> None:
-        """One decoded SSE `data:` payload, from either provider."""
+        """One decoded SSE `data:` payload, from any provider."""
         if self.flavor == "openai":
             return self._openai_event(payload)
+        if self.flavor == "responses":
+            return self._responses_event(payload)
         kind = payload.get("type")
         if kind == "message_start":
             message = payload.get("message") or {}
@@ -213,13 +279,15 @@ class UsageSniffer:
             self._openai_event(payload)
 
     def feed_body(self, body: bytes) -> None:
-        """A complete non-streaming response body, from either provider."""
+        """A complete non-streaming response body, from any provider."""
         try:
             payload = json.loads(body)
         except (ValueError, UnicodeDecodeError):
             return
         if not isinstance(payload, dict):
             return
+        if self.flavor == "responses":
+            return self._responses_snapshot(payload)
         self.model = payload.get("model") or self.model
         if self.flavor == "openai" or (self.flavor is None and "choices" in payload):  # OpenAI
             self._openai_usage(payload.get("usage") or {})
