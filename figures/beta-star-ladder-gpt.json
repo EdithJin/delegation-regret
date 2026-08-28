@@ -1,0 +1,93 @@
+{
+  "what": "GPT-5.6 Sol delegation curve (reasoning-none tool mode): executed serial vs max-fanout arm pairs, same scenarios/seeds as the opus curve. beta* null at EVERY rung: fan-out dominated (loses both axes) throughout the validated range \u2014 no delegation-pays region exists.",
+  "date": "2026-08-27",
+  "model": "gpt-5.6-sol",
+  "calibration": "results/cal-gpt/calibration.json",
+  "floors": {
+    "dollars": 0.059,
+    "minutes": 0.263
+  },
+  "total_spend_dollars": 1.3926,
+  "comparability_caveats": [
+    "reasoning_effort none (REQUIRED for tools on chat completions; opus leg runs high)",
+    "automatic unpinnable caching vs opus's pinned 1h TTL"
+  ],
+  "rungs": [
+    {
+      "node_size": 3,
+      "scenario": "wide4-s3-11",
+      "serial": {
+        "dollars": 0.0368,
+        "minutes": 0.1599
+      },
+      "fanout": {
+        "dollars": 0.1179,
+        "minutes": 0.3393
+      },
+      "beta_star_per_min": null,
+      "latency_ratio_serial_over_fanout": 0.471,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-gpt-wide4-s3/"
+      }
+    },
+    {
+      "node_size": 8,
+      "scenario": "wide4-s8-11",
+      "serial": {
+        "dollars": 0.1206,
+        "minutes": 0.4882
+      },
+      "fanout": {
+        "dollars": 0.1816,
+        "minutes": 1.0052
+      },
+      "beta_star_per_min": null,
+      "latency_ratio_serial_over_fanout": 0.486,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-gpt-wide4-s8/"
+      }
+    },
+    {
+      "node_size": 15,
+      "scenario": "wide4-s15-11",
+      "serial": {
+        "dollars": 0.1745,
+        "minutes": 0.5949
+      },
+      "fanout": {
+        "dollars": 0.1897,
+        "minutes": 1.0237
+      },
+      "beta_star_per_min": null,
+      "latency_ratio_serial_over_fanout": 0.581,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-gpt-wide4-s15/"
+      }
+    },
+    {
+      "node_size": 25,
+      "scenario": "wide4-s25-11",
+      "serial": {
+        "dollars": 0.1987,
+        "minutes": 0.5984
+      },
+      "fanout": {
+        "dollars": 0.3728,
+        "minutes": 1.5625
+      },
+      "beta_star_per_min": null,
+      "latency_ratio_serial_over_fanout": 0.383,
+      "valid": true,
+      "provenance": {
+        "kind": "executed arm pair, single draw each",
+        "path": "results/probe-gpt-wide4-s25/"
+      }
+    }
+  ]
+}
