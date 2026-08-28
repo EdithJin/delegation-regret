@@ -112,6 +112,8 @@ CELLS = [
          correct="delegate", note="flip replication on a second generated instance"),
     dict(id="w15b-stated-b0", shape="wide", n=4, size=15, seed=23, cond="stated-b0", runs=1, est=0.7,
          correct="serial", note="flip replication, beta=0 side"),
+    dict(id="w15b-blind", shape="wide", n=4, size=15, seed=23, cond="blind", runs=2, est=0.8,
+         note="ADAPTIVE (Aug 27): blind instance replication — the 62% claim was seed-11 only"),
     # -- size contrast ------------------------------------------------------
     dict(id="w25-stated-b1", shape="wide", n=4, size=25, seed=11, cond="stated-b1", runs=2, est=1.2,
          correct="delegate", note="fat-margin delegate cell (+$0.51)"),
