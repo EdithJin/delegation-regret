@@ -76,6 +76,7 @@ from .runner import Budget
 
 ANTHROPIC_API = "https://api.anthropic.com"
 OPENAI_API = "https://api.openai.com"
+MOONSHOT_API = "https://api.moonshot.ai"  # OpenAI-compatible; client appends /v1/chat/completions
 
 # Dollars per million tokens, from the vendor's published rates, checked
 # 2026-08-24. Cache reads are 0.1x input; cache writes carry the 2x premium of
@@ -137,6 +138,17 @@ PRICE_SHEETS: dict[str, PriceSheet] = {
         input_per_mtok=5.00, output_per_mtok=30.00,
         cache_read_per_mtok=0.50, cache_write_per_mtok=0.00,
     ),
+    # kimi-k3 is the open-weight leg: Moonshot's 2.8T-parameter MoE (weights
+    # public 2026-07-26), served first-party at api.moonshot.ai. Rates from
+    # platform.kimi.ai checked 2026-08-28: $3.00/MTok cache-miss input,
+    # $0.30/MTok cache-hit input, $15.00/MTok output. Caching is automatic
+    # (256-token threshold) with nothing billed to write, so cache_write is a
+    # true zero like the gpt leg -- and like that leg, no TTL exists to pin.
+    "kimi-k3": PriceSheet(
+        model="kimi-k3", as_of="2026-08-28",
+        input_per_mtok=3.00, output_per_mtok=15.00,
+        cache_read_per_mtok=0.30, cache_write_per_mtok=0.00,
+    ),
 }
 
 
@@ -182,6 +194,18 @@ HARNESS_SPEC: dict[str, dict] = {
     # OpenAI-compatible open-source leg, which speaks only chat completions
     # (spec shape: {"max_tokens": ..., "effort": "none", "api": "chat"}).
     "gpt-5.6-sol": {"max_tokens": 16000, "effort": "high", "api": "responses"},
+    # The open-weight leg, on the chat-completions dialect OSS serving speaks.
+    # kimi-k3's reasoning is ALWAYS ON (there is no "none"); its effort roster
+    # is low/high/max with "max" both the vendor default and the top tier. The
+    # pin is "max" by the cross-leg rule: every model runs at its vendor's
+    # HIGHEST named effort (opus "high" and gpt "high" are their vendors' tops;
+    # K3's top is "max" -- matching the label instead would run it one tier
+    # below its peers). Vendor effort scales are not cross-calibrated; the
+    # comparability caveat above covers this leg too. The gpt-only
+    # tools-require-effort-none constraint does NOT apply here: kimi-k3 takes
+    # tools and reasoning together on chat completions (platform docs,
+    # 2026-08-28; wire preflight must confirm before any calibrated spend).
+    "kimi-k3": {"max_tokens": 16000, "effort": "max", "api": "chat"},
 }
 
 
@@ -198,24 +222,29 @@ def price_sheet(key: str) -> PriceSheet:
 
 
 def provider_for(model: str) -> str:
-    """Which wire format a pinned model speaks: "openai" for gpt-*, otherwise
-    "anthropic". The prefix is the dispatch rule on purpose -- a new gpt model
+    """Which wire format a pinned model speaks: "openai" for gpt-* and kimi-*
+    (Moonshot serves the OpenAI-compatible dialect), otherwise "anthropic".
+    The prefix is the dispatch rule on purpose -- a new model of a known wire
     needs only its sheets and spec entered above, not a new branch."""
-    return "openai" if model.startswith("gpt-") else "anthropic"
+    return "openai" if model.startswith(("gpt-", "kimi-")) else "anthropic"
 
 
 def endpoint_defaults(model: str, base_url: str, api_key_env: str) -> tuple[str, str]:
-    """Re-route the two Anthropic-shaped defaults when the model is OpenAI's.
+    """Re-route the two Anthropic-shaped defaults to the model's own vendor.
 
     Only the untouched defaults move: an explicit --base-url or --api-key-env
-    always wins, which is both how tests point a gpt model at a local fake and
-    how a real run reaches an OpenAI-compatible open-source endpoint.
+    always wins, which is both how tests point a gpt or kimi model at a local
+    fake and how a real run reaches any other OpenAI-compatible endpoint.
+    kimi-* speaks the OpenAI dialect but lives on Moonshot's host with its own
+    key -- same wire, different door.
     """
     if provider_for(model) == "openai":
+        vendor_url = MOONSHOT_API if model.startswith("kimi-") else OPENAI_API
+        vendor_key = "KIMI_API_KEY" if model.startswith("kimi-") else "OPENAI_API_KEY"
         if base_url == ANTHROPIC_API:
-            base_url = OPENAI_API
+            base_url = vendor_url
         if api_key_env == "ANTHROPIC_API_KEY":
-            api_key_env = "OPENAI_API_KEY"
+            api_key_env = vendor_key
     return base_url, api_key_env
 
 
@@ -232,7 +261,9 @@ def client_for_model(model: str, api_key: str, base_url: str,
         # gpt-* defaults to the responses wire format -- the one that takes
         # tools and reasoning together. A spec pinning {"api": "chat"} selects
         # the chat-completions client instead: the dialect OpenAI-compatible
-        # open-source servers speak, where the effort-"none" tools pin applies.
+        # open-source servers speak. The tools-require-effort-"none" pin is a
+        # gpt-5.6 property of that dialect, not a property of the dialect
+        # itself -- kimi-k3 takes tools with reasoning "max" on the same wire.
         if spec.get("api", "responses") == "responses":
             return OpenAIResponsesClient(
                 model=model,

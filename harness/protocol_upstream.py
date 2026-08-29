@@ -80,6 +80,16 @@ _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # this offline fake can certify.
 _OPENAI_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
+# kimi-k3's effort values. Probed live 2026-08-28: the REAL endpoint does not
+# validate this field at all -- garbage values are silently ignored (default
+# "max" applies), and "none", contrary to the docs' always-on claim, genuinely
+# DISABLES reasoning (200, no reasoning_content, 11 completion tokens). This
+# fake is DELIBERATELY stricter than that wire: a typo'd effort would silently
+# run at the default on the real endpoint, and a stray "none" would silently
+# run reasoning-off -- the exact class of quiet operating-point drift that
+# burned the gpt leg. Off-roster values fail offline instead.
+_KIMI_EFFORT_LEVELS = ("low", "high", "max")
+
 
 def _check_cache_control(block: dict, where: str) -> None:
     cc = block.get("cache_control")
@@ -206,7 +216,14 @@ def _validate_openai(payload: dict) -> str:
     if mct is not None and (not isinstance(mct, int) or isinstance(mct, bool) or mct < 1):
         raise ProtocolError(f"openai: max_completion_tokens {mct!r} is not a positive integer")
     effort = payload.get("reasoning_effort")
-    if effort is not None and effort not in _OPENAI_EFFORT_LEVELS:
+    if model.startswith("kimi-"):
+        # Moonshot's dialect: tools + reasoning coexist (no gpt-style "none"
+        # requirement), but the roster is narrower and "none" does not exist.
+        if effort is not None and effort not in _KIMI_EFFORT_LEVELS:
+            raise ProtocolError(
+                f"openai: kimi reasoning_effort roster is low/high/max, got {effort!r}"
+            )
+    elif effort is not None and effort not in _OPENAI_EFFORT_LEVELS:
         raise ProtocolError(f"openai: unknown reasoning_effort {effort!r}")
 
     first_user = ""
@@ -531,6 +548,16 @@ def _openai_frames(turn: Turn, model: str, include_usage: bool) -> list:
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
     ]
+    if model.startswith("kimi-"):
+        # kimi-k3 reasons visibly on this dialect: reasoning_content deltas
+        # stream BEFORE the answer's content deltas. The client must ignore
+        # them -- neither crashing nor concatenating them into the text -- so
+        # the fake always emits some, keeping that tolerance pinned offline.
+        for piece in _halves("considering the workspace before acting"):
+            frames.append(
+                {"choices": [{"index": 0, "delta": {"reasoning_content": piece},
+                              "finish_reason": None}]}
+            )
     for piece in _halves(turn.text):
         frames.append(
             {"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
