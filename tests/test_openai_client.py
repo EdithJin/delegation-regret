@@ -42,15 +42,19 @@ from harness.runner import run_agent
 
 
 def pinned_client(base_url: str) -> OpenAIClient:
-    """The gpt-5.6-sol harness spec, as build_client would assemble it."""
+    """The gpt-5.6-sol harness spec, as build_client would assemble it.
+
+    effort "none" mirrors HARNESS_SPEC: the live endpoint rejects function
+    tools on chat completions at any other effort (wire_preflight.py case 4),
+    and the fake now enforces the same 400."""
     return OpenAIClient(model="gpt-5.6-sol", api_key="k", base_url=base_url,
-                        max_tokens=16000, effort="high")
+                        max_tokens=16000, effort="none")
 
 
 class TestPinnedSpecOnTheWire(unittest.TestCase):
     """The published constants of the OpenAI leg, checked on the wire.
 
-    max_completion_tokens 16000 and reasoning_effort high are the leg's half of
+    max_completion_tokens 16000 and reasoning_effort none are the leg's half of
     the Aug 24 harness-spec discipline; stream + stream_options.include_usage
     are not optional pins but the shape of the measurement itself -- without
     include_usage the final chunk carries no usage and every Reply reads zero.
@@ -65,7 +69,7 @@ class TestPinnedSpecOnTheWire(unittest.TestCase):
             sent = self._sent(pinned_client(up.base_url), up)
             self.assertEqual(up.violations, [])
         self.assertEqual(sent["max_completion_tokens"], 16000)
-        self.assertEqual(sent["reasoning_effort"], "high")
+        self.assertEqual(sent["reasoning_effort"], "none")
         self.assertIs(sent["stream"], True)
         self.assertEqual(sent["stream_options"], {"include_usage": True})
         self.assertEqual(sent["tool_choice"], "auto")
@@ -343,6 +347,7 @@ class TestTheFakeRejectsTheRealEndpoint400s(unittest.TestCase):
             "tools": [{"type": "function",
                        "function": {"name": "x", "description": "d", "parameters": {}}}],
             "max_completion_tokens": 16000,
+            "reasoning_effort": "none",  # required with tools (wire_preflight case 4)
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -381,7 +386,22 @@ class TestTheFakeRejectsTheRealEndpoint400s(unittest.TestCase):
                                     "function": {"name": "x", "arguments": '{"p": 1}'}}))
 
     def test_the_accepted_shape_is_accepted(self) -> None:
-        self.assertEqual(_validate_openai(self._payload(reasoning_effort="high")), "go")
+        self.assertEqual(_validate_openai(self._payload()), "go")
+
+    def test_tools_demand_effort_none_on_chat_completions(self) -> None:
+        # Verified live 2026-08-27 (wire_preflight.py case 4): with tools
+        # present, any effort other than an explicit "none" is a 400 -- and
+        # omitting the field entirely is too, because the default is non-none.
+        with self.assertRaises(ProtocolError):
+            _validate_openai(self._payload(reasoning_effort="high"))
+        no_effort = self._payload()
+        del no_effort["reasoning_effort"]
+        with self.assertRaises(ProtocolError):
+            _validate_openai(no_effort)
+        # (Reasoning WITHOUT tools is fine on the real endpoint -- that half
+        # of the pairing lives in wire_preflight.py case 3, because this fake
+        # deliberately refuses tool-less requests: the harness always offers
+        # tools, so a tool-less payload is a harness bug, not a valid shape.)
 
     def test_forgetting_include_usage_yields_a_stream_with_no_usage(self) -> None:
         # Not a 400 on a real endpoint -- worse: a silent zero in every token

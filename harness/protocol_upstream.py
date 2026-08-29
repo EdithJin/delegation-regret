@@ -194,6 +194,16 @@ def _validate_openai(payload: dict) -> str:
     effort = payload.get("reasoning_effort")
     if effort is not None and effort not in _OPENAI_EFFORT_LEVELS:
         raise ProtocolError(f"openai: unknown reasoning_effort {effort!r}")
+    # Verified against the live endpoint 2026-08-27 (wire_preflight.py case 4):
+    # gpt-5.6 rejects function tools on chat completions unless reasoning_effort
+    # is explicitly "none" -- the default is non-none, so OMITTING the field
+    # with tools present also 400s. Reasoning-plus-tools needs /v1/responses.
+    if payload.get("tools") and model.startswith("gpt-") and effort != "none":
+        raise ProtocolError(
+            f"openai: function tools with reasoning_effort are not supported for "
+            f"{model} in /v1/chat/completions; use /v1/responses or set "
+            "reasoning_effort to 'none'"
+        )
 
     first_user = ""
     pending: list[str] = []
