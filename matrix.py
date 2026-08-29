@@ -116,6 +116,8 @@ CELLS = [
          note="ADAPTIVE (Aug 27): blind instance replication — the 62% claim was seed-11 only"),
     dict(id="c15b-blind", shape="chain", n=4, size=15, seed=23, cond="blind", runs=2, est=0.9,
          correct="serial", note="ADAPTIVE (Aug 27): the placebo FIRED once on seed 11 (k=4, +$0.73 pure waste) — second seed per the surprise rule"),
+    dict(id="w3-blind", shape="wide", n=4, size=3, seed=11, cond="blind", runs=2, est=0.3,
+         correct="serial", note="GPT leg: below-boundary blind baseline (opus's 0% came from pass-1; GPT needs its own)"),
     # -- size contrast ------------------------------------------------------
     dict(id="w25-stated-b1", shape="wide", n=4, size=25, seed=11, cond="stated-b1", runs=2, est=1.2,
          correct="delegate", note="fat-margin delegate cell (+$0.51)"),
