@@ -246,6 +246,24 @@ class TestForcedPlan(unittest.TestCase):
         self.assertIn("Issue exactly 1 spawn_subagent call", text)
         self.assertIn(self.scn.subtasks[self.ids[1]].module, text)
 
+    def test_pack_spawns_is_off_by_default_and_additive_when_on(self) -> None:
+        # The baseline wording is the frozen instrument every existing run used;
+        # the packing line is a separate condition, so it must be opt-in, appear
+        # only when the plan actually spawns, and change the baseline text by
+        # exactly one added line -- nothing rewritten.
+        base = describe_plan(self.scn, self.plan)
+        packed = describe_plan(self.scn, self.plan, pack_spawns=True)
+        self.assertNotIn("ONE message", base)
+        base_lines = [l for l in base.splitlines() if l]
+        packed_lines = [l for l in packed.splitlines() if l]
+        extra = [l for l in packed_lines if l not in base_lines]
+        self.assertEqual(len(extra), 1, extra)
+        self.assertIn("ONE message", extra[0])
+        self.assertEqual([l for l in packed_lines if l in base_lines], base_lines)
+
+        no_blocks = Plan(inline=frozenset(self.ids), blocks=())
+        self.assertNotIn("ONE message", describe_plan(self.scn, no_blocks, pack_spawns=True))
+
     def test_a_compliant_run_carries_no_deviation_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace = run_plan(self.scn, self.plan, self._client(True), tmp)

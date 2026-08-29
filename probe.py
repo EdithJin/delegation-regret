@@ -57,6 +57,10 @@ def parse_args(argv):
     p.add_argument("--max-output-tokens", type=int, default=200_000,
                    help="per-arm Budget ceiling; ~$5 worst case at opus output rates")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--pack-spawns", action="store_true",
+                   help="add the single-turn spawn-packing line to the plan directive "
+                        "(the disambiguation condition; a separate labeled arm, never "
+                        "comparable with baseline-wording runs)")
     return p.parse_args(argv)
 
 
@@ -127,10 +131,11 @@ def main(argv=None) -> int:
         print(f"\n  running {name} arm ...", flush=True)
         trace = run_plan(
             scenario, plan, client, out / f"work-{name}",
-            condition=f"probe-{name}",
+            condition=f"probe-{name}" + ("-packed" if args.pack_spawns else ""),
             max_turns=args.max_turns,
             budget=Budget(max_output_tokens=args.max_output_tokens),
             proxy_log=out / f"{name}-proxy.jsonl",
+            pack_spawns=args.pack_spawns,
         )
         trace.write(out / f"{name}-trace.json")
         d, m = trace.dollars(price), trace.analytic_minutes(timing)
@@ -149,6 +154,7 @@ def main(argv=None) -> int:
 
     summary = {
         "scenario": scenario.id, "model": price.model, "calibration": args.calibration,
+        "pack_spawns": args.pack_spawns,
         "predicted": {k: {"dollars": v.cost, "minutes": v.latency} for k, v in predicted.items()},
         "predicted_beta_star": pb,
         "measured": measured,
