@@ -7,10 +7,19 @@ venv/
 .ipynb_checkpoints/
 
 # Full run traces stay out of history; the published copy ships only a small
-# curated sample (TASKS section 2, Fri), force-added under results/sample/.
+# curated sample, force-added under results/sample/.
 results/*
 !results/sample/
 
-# Held back until regenerated under measured curves (TASKS Tue item)
+# Held back until regenerated under measured curves
 figures/beta-staircase.svg
 figures/make_beta_staircase.py
+
+# Working documents kept local, deliberately out of history
+TASKS-AND-OPEN-ISSUES.md
+REPORT-EVIDENCE-INDEX.md
+DATASET-BOUNDARY-DEFECT.md
+MATRIX-RESULTS.md
+OPENAI-LEG-PREFLIGHT.md
+RESPONSES-PREFLIGHT.md
+report/
