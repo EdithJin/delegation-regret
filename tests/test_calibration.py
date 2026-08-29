@@ -545,23 +545,30 @@ class TestHeldOutCheck(unittest.TestCase):
 
 class TestSignGuards(unittest.TestCase):
     """A wrong-signed constant is worse than an honest placeholder, because the
-    sign is what the constant MEANS. Both guards refuse rather than clamp:
-    clamping to zero asserts the effect is free, which is the same unmeasured
-    claim pointing the other way."""
+    sign is what the constant MEANS. A bare clamp to zero would assert the
+    effect is free -- the same unmeasured claim pointing the other way -- so a
+    wrong sign is never clamped. It is refused, unless the log itself carries
+    an independent measurement that settles the split: a negative prefill
+    coefficient falls back to the TTFB slope against context (prefill observed
+    directly, generation excluded by construction), and refusal remains for
+    logs whose TTFB cannot identify a slope either. The fallback is
+    model-agnostic and unreachable from any log whose primary fit succeeds."""
 
-    def _records(self, rows):
+    def _records(self, rows, ttfb=None):
         from harness.proxy import CallRecord
 
         return [
-            CallRecord(seq=i, path="", input_tokens=i_t, output_tokens=o_t, total_s=s)
+            CallRecord(seq=i, path="", input_tokens=i_t, output_tokens=o_t, total_s=s,
+                       ttfb_s=0.0 if ttfb is None else ttfb[i])
             for i, (i_t, o_t, s) in enumerate(rows)
         ]
 
-    def test_a_negative_prefill_coefficient_is_refused(self) -> None:
+    def test_a_negative_prefill_coefficient_is_refused_without_ttfb(self) -> None:
         # A bigger context cannot be faster to START. Left alone it flips the
         # sign of context drag in the latency column, and the absorption minutes
         # derived from it come out negative too -- every absorbed result would
-        # shorten the run.
+        # shorten the run. With no TTFB in the log there is nothing to anchor
+        # prefill to, so the original refusal stands.
         # Input and output must vary INDEPENDENTLY here, or the design matrix is
         # singular and the earlier "not identifiable" guard fires first -- also
         # correct, but a different failure.
@@ -569,6 +576,41 @@ class TestSignGuards(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             fit_timing_model(self._records(rows))
         self.assertIn("negative cost per input token", str(caught.exception))
+
+    def test_negative_prefill_with_flat_ttfb_anchors_to_zero(self) -> None:
+        # The reasoning-model case measured live on 2026-08-28: thinking time
+        # swells output in step with context, the total_s split goes negative,
+        # but TTFB sits flat across context sizes -- prefill observably costs
+        # ~nothing. The fit must pin prefill to the flat slope (0 after the
+        # physical floor) and price all duration through output, thinking
+        # included, instead of refusing.
+        rows = [(1000, 100, 5.0), (5000, 100, 3.0), (1000, 300, 9.0), (5000, 300, 7.0)]
+        tm = fit_timing_model(self._records(rows, ttfb=[0.5, 0.5, 0.5, 0.5]))
+        self.assertEqual(tm.prefill_source, "ttfb-anchor")
+        self.assertEqual(tm.b_minutes_per_input_token, 0.0)
+        self.assertGreater(tm.output_tokens_per_minute, 0.0)
+        # duration still fully accounted: throughput comes from the o=100 vs
+        # o=300 contrast, (8-4)/200 min per token
+        self.assertAlmostEqual(1.0 / tm.output_tokens_per_minute, (4.0 / 60.0) / 200.0)
+
+    def test_negative_prefill_with_sloped_ttfb_uses_the_measured_slope(self) -> None:
+        # When TTFB does grow with context, the anchor is that measured price,
+        # not zero: 0.6s at 1000 context tokens, 3.0s at 5000, slope 0.0006
+        # s/token = 1e-05 min/token.
+        rows = [(1000, 100, 5.0), (5000, 100, 3.0), (1000, 300, 9.0), (5000, 300, 7.0)]
+        tm = fit_timing_model(self._records(rows, ttfb=[0.6, 3.0, 0.6, 3.0]))
+        self.assertEqual(tm.prefill_source, "ttfb-anchor")
+        self.assertAlmostEqual(tm.b_minutes_per_input_token, 1e-05)
+
+    def test_a_clean_primary_fit_never_touches_the_anchor(self) -> None:
+        # The Claude-leg invariant: a log whose total_s fit succeeds keeps
+        # byte-identical constants whether or not TTFB is present -- the
+        # fallback is unreachable from the primary path.
+        rows = [(1000, 100, 2.0), (5000, 100, 4.0), (1000, 300, 6.0), (5000, 300, 8.0)]
+        plain = fit_timing_model(self._records(rows))
+        with_ttfb = fit_timing_model(self._records(rows, ttfb=[0.5, 1.4, 0.5, 1.4]))
+        self.assertEqual(plain.prefill_source, "total-s")
+        self.assertEqual(plain, with_ttfb)
 
     def test_perfectly_collinear_calls_are_refused_too(self) -> None:
         # A log where input is a fixed multiple of output cannot separate prefill
