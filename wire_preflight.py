@@ -40,6 +40,29 @@ def cases(model: str):
     base = {"model": model,
             "messages": [{"role": "user", "content": "say ok"}],
             "max_completion_tokens": 16}
+    if model.startswith("kimi-"):
+        # The Moonshot profile, pinned by LIVE probes 2026-08-28 (which twice
+        # corrected the docs): tools ride WITH reasoning -- the exact inversion
+        # of gpt-5.6's tools-need-"none" rule below -- making the
+        # tools-default-effort 200 this leg's founding fact. The endpoint does
+        # NOT validate reasoning_effort (garbage silently runs at the default),
+        # and "none", despite the docs' always-on claim, genuinely disables
+        # reasoning; the offline fake stays stricter than this wire on purpose.
+        return [
+            ("minimal", base, 200, None),
+            ("stream+usage", {**base, "stream": True,
+                              "stream_options": {"include_usage": True}}, 200, None),
+            ("reasoning-max-no-tools", {**base, "reasoning_effort": "max"}, 200, None),
+            ("reasoning-none-accepted-off", {**base, "reasoning_effort": "none"},
+             200, None),
+            ("tools-default-effort", {**base, "tools": [TOOL], "tool_choice": "auto"},
+             200, None),
+            ("tools+effort-max", {**base, "reasoning_effort": "max",
+                                  "max_completion_tokens": 200,
+                                  "messages": [{"role": "user",
+                                                "content": "call the tool f with no args"}],
+                                  "tools": [TOOL], "tool_choice": "auto"}, 200, None),
+        ]
     return [
         # (name, payload, expect_status, expect_in_error)
         ("minimal", base, 200, None),
@@ -71,9 +94,17 @@ def probe(url: str, key: str, payload: dict) -> tuple[int, str]:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", default="gpt-5.6-sol")
-    p.add_argument("--base-url", default="https://api.openai.com")
-    p.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    p.add_argument("--base-url", default=None,
+                   help="default: the model's own vendor (api.openai.com; "
+                        "api.moonshot.ai for kimi-*)")
+    p.add_argument("--api-key-env", default=None,
+                   help="default: OPENAI_API_KEY, or KIMI_API_KEY for kimi-*")
     args = p.parse_args(argv)
+    kimi = args.model.startswith("kimi-")
+    if args.base_url is None:
+        args.base_url = "https://api.moonshot.ai" if kimi else "https://api.openai.com"
+    if args.api_key_env is None:
+        args.api_key_env = "KIMI_API_KEY" if kimi else "OPENAI_API_KEY"
 
     key = os.environ.get(args.api_key_env, "")
     if not key:
