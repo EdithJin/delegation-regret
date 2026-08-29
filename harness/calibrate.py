@@ -235,6 +235,12 @@ class TimingModel:
     b_cached_minutes_per_token: float | None = None  # per cache-read token; None = blended
     n_calls: int = 0
     residual_rms_minutes: float = 0.0
+    # "total-s" = prefill separated by the least-squares fit against total_s.
+    # "ttfb-anchor" = total_s could not separate prefill from generation (the
+    # unconstrained coefficient came out negative), so prefill was pinned to the
+    # slope of TTFB against context -- the direct prefill observation -- and only
+    # the intercept and throughput were fitted against total_s.
+    prefill_source: str = "total-s"
 
     @property
     def cached_minutes_per_token(self) -> float:
@@ -329,23 +335,77 @@ def fit_timing_model(calls: list[CallRecord]) -> TimingModel:
         # absorption minutes are derived from it, and they would come out
         # negative too, making every absorbed result shorten the run.
         #
-        # It happens when context size does not vary independently of output
-        # length across the log, so the regression cannot separate the two. The
-        # answer is more varied calls, not a clamp: clamping to zero would assert
-        # prefill is free, which is the same unmeasured claim in the other
-        # direction.
-        raise ValueError(
-            f"fitted a negative cost per input token ({b:.3g} min/token), which would make "
-            "a larger context faster to start. Context and output length are too correlated "
-            "in this log to separate prefill from generation -- vary them independently "
-            "across the calibration calls"
-        )
+        # It happens when total_s cannot separate prefill from generation --
+        # under a reasoning model, hidden thinking time swells `output_tokens`
+        # in step with context depth, so the two regressors move together and
+        # the split between them is arbitrary. A bare clamp to zero would
+        # assert prefill is free without measuring it. But the log usually
+        # carries a direct prefill observation total_s does not need: TTFB,
+        # which ends when generation begins. When it does, pin `b` to the TTFB
+        # slope against context (floored at physical zero) and fit only the
+        # intercept and throughput against total_s. Refusal remains for logs
+        # whose TTFB cannot identify a slope either.
+        return _ttfb_anchored_fit(rows, ys, fresh, cached, outs, unconstrained_b=b)
     return TimingModel(
         a_minutes=a,
         b_minutes_per_input_token=b,
         output_tokens_per_minute=1.0 / c_out,
         n_calls=len(rows),
         residual_rms_minutes=rms,
+    )
+
+
+def _ttfb_anchored_fit(
+    rows: list[CallRecord],
+    ys: list[float],
+    fresh: list[float],
+    cached: list[float],
+    outs: list[float],
+    *,
+    unconstrained_b: float,
+) -> TimingModel:
+    """The rescue for a log whose total_s fit put prefill below zero.
+
+    Model-agnostic by construction: `fit_timing_model` reaches here only when
+    the unconstrained fit is unphysical, whichever model produced the log. Legs
+    whose primary fit succeeds (every Claude calibration to date) never enter.
+
+    TTFB ends when generation begins, so its slope against context is the
+    prefill price observed directly, free of the thinking-time confound that
+    sank the total_s separation. Pin `b` to that slope (floored at physical
+    zero), then fit intercept and throughput against total_s as usual. The
+    original refusal stands when TTFB cannot identify a slope either -- fewer
+    than 3 timed first bytes, or no context variation among them.
+    """
+    tt = [
+        (r.ttfb_s / 60.0, f + cr)
+        for r, f, cr in zip(rows, fresh, cached)
+        if r.ttfb_s and r.ttfb_s > 0
+    ]
+    if len(tt) < 3 or len({ctx for _, ctx in tt}) < 2:
+        raise ValueError(
+            f"fitted a negative cost per input token ({unconstrained_b:.3g} min/token), "
+            "which would make a larger context faster to start, and the log carries no "
+            "usable TTFB to anchor prefill directly. Context and output length are too "
+            "correlated in this log to separate prefill from generation -- vary them "
+            "independently across the calibration calls"
+        )
+    (_, slope), _ = _fit([(1.0, ctx) for _, ctx in tt], [t for t, _ in tt])
+    b_anchor = max(slope, 0.0)
+    ys_less_prefill = [y - b_anchor * (f + cr) for y, f, cr in zip(ys, fresh, cached)]
+    (a, c_out), rms = _fit([(1.0, o) for o in outs], ys_less_prefill)
+    if c_out <= 0:
+        raise ValueError(
+            "fitted a non-positive cost per output token; the log is too narrow to "
+            "identify throughput -- vary output length across the calibration calls"
+        )
+    return TimingModel(
+        a_minutes=a,
+        b_minutes_per_input_token=b_anchor,
+        output_tokens_per_minute=1.0 / c_out,
+        n_calls=len(rows),
+        residual_rms_minutes=rms,
+        prefill_source="ttfb-anchor",
     )
 
 

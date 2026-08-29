@@ -253,6 +253,7 @@ def describe_plan(
     plan: Plan,
     order: tuple[int, ...] | None = None,
     node_order: tuple[str, ...] | None = None,
+    pack_spawns: bool = False,
 ) -> str:
     """The plan directive appended to a forced run's prompt.
 
@@ -299,6 +300,18 @@ def describe_plan(
                 for n in sorted(block)
             )
             lines.append(f"  {i + 1}. subagent for {names} — give it {files}")
+        if pack_spawns:
+            # The disambiguation condition (2026-08-28): the baseline wording
+            # above never says WHEN to issue the calls, and models resolve that
+            # ambiguity differently -- one packs them into a single turn (they
+            # then run concurrently), another issues one per turn and waits.
+            # This line removes the ambiguity; runs carrying it are a separate,
+            # labeled condition, never comparable with the baseline wording.
+            lines.append(
+                "- Issue ALL of these spawn_subagent calls together in ONE "
+                "message (a single assistant turn), so they run concurrently. "
+                "Do not wait for any subagent's result before issuing the rest."
+            )
     else:
         lines.append("- Do not spawn any subagent.")
     lines.append("")
@@ -613,6 +626,7 @@ def run_plan(
     budget: Budget | None = None,
     retry: RetryPolicy | None = None,
     proxy_log: str | Path | None = None,
+    pack_spawns: bool = False,
 ) -> Trace:
     """Execute a GIVEN plan for real, and check the run actually followed it.
 
@@ -630,7 +644,7 @@ def run_plan(
         max_turns=max_turns,
         condition=condition,
         repeat=repeat,
-        directive=describe_plan(scenario, plan, order, node_order),
+        directive=describe_plan(scenario, plan, order, node_order, pack_spawns=pack_spawns),
         budget=budget,
         retry=retry,
         proxy_log=proxy_log,

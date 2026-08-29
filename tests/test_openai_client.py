@@ -34,7 +34,7 @@ from harness.cli import (
     endpoint_defaults,
     provider_for,
 )
-from harness.client import AnthropicClient, OpenAIClient
+from harness.client import AnthropicClient, OpenAIClient, OpenAIResponsesClient
 from harness.fake_upstream import EXPECTED_OPENAI_STREAM, FakeUpstream
 from harness.protocol_upstream import ProtocolError, ProtocolUpstream, Turn, _validate_openai
 from harness.proxy import LoggingProxy
@@ -42,11 +42,16 @@ from harness.runner import run_agent
 
 
 def pinned_client(base_url: str) -> OpenAIClient:
-    """The gpt-5.6-sol harness spec, as build_client would assemble it.
+    """The chat-completions client, pinned the only way a gpt model can use it.
 
-    effort "none" mirrors HARNESS_SPEC: the live endpoint rejects function
-    tools on chat completions at any other effort (wire_preflight.py case 4),
-    and the fake now enforces the same 400."""
+    Since the 2026-08-27 move to /v1/responses, gpt-5.6-sol itself dispatches
+    to OpenAIResponsesClient (tests/test_responses_client.py); this client
+    stays for the OpenAI-compatible open-source path. effort "none" here is
+    not a preference but the wire rule for gpt-* on THIS dialect: the live
+    endpoint rejects function tools on chat completions at any other effort
+    (wire_preflight.py case 4), and the fake enforces the same 400. The
+    reasoning path this client still carries is exercised by models whose
+    chat dialect allows it (the kimi leg, at effort "max")."""
     return OpenAIClient(model="gpt-5.6-sol", api_key="k", base_url=base_url,
                         max_tokens=16000, effort="none")
 
@@ -270,22 +275,23 @@ class TestProviderDispatch(unittest.TestCase):
         self.assertEqual(provider_for("claude-opus-5"), "anthropic")
         self.assertEqual(provider_for("claude-haiku-4-5"), "anthropic")
 
-    def test_a_gpt_model_gets_the_openai_client_with_its_spec(self) -> None:
+    def test_a_gpt_model_gets_the_responses_client_with_its_spec(self) -> None:
+        # Moved off chat completions 2026-08-27: tools on that wire format
+        # required effort "none", and /v1/responses is where reasoning came
+        # back on. The routing itself is pinned in test_responses_client.py;
+        # here the pin is that build_client assembles the published constants.
         with mock.patch.dict("os.environ", {"DELEGATION_TEST_KEY": "sk-test"}):
             client = build_client(self._args(), PRICE_SHEETS["gpt-5.6-sol"])
-        self.assertIsInstance(client, OpenAIClient)
+        self.assertIsInstance(client, OpenAIResponsesClient)
         self.assertEqual(client.model, "gpt-5.6-sol")
-        # "none" is REQUIRED by the live endpoint: function tools on chat
-        # completions 400 unless reasoning_effort is explicitly "none"
-        # (verified 2026-08-27; reasoning-on needs /v1/responses).
-        self.assertEqual(client.effort, "none")
+        self.assertEqual(client.effort, "high")
         self.assertEqual(client.max_tokens, 16000)
 
     def test_the_list_sheet_prices_the_same_client(self) -> None:
         # "@list" restates rates; the client it builds must be identical.
         with mock.patch.dict("os.environ", {"DELEGATION_TEST_KEY": "sk-test"}):
             client = build_client(self._args(), PRICE_SHEETS["gpt-5.6-sol@list"])
-        self.assertIsInstance(client, OpenAIClient)
+        self.assertIsInstance(client, OpenAIResponsesClient)
         self.assertEqual(client.model, "gpt-5.6-sol")
 
     def test_a_claude_model_still_gets_the_anthropic_client(self) -> None:
@@ -319,10 +325,13 @@ class TestProviderDispatch(unittest.TestCase):
 
     def test_the_openai_spec_pins_what_it_should_and_nothing_else(self) -> None:
         # max_tokens 16000 matches the --max-tokens default every leg runs
-        # under; thinking and cache_ttl are deliberately absent -- there is no
-        # TTL to pin on automatic caching, which is the published
-        # comparability caveat on the HARNESS_SPEC entry.
-        self.assertEqual(HARNESS_SPEC["gpt-5.6-sol"], {"max_tokens": 16000, "effort": "none"})
+        # under; "api": "responses" is the 2026-08-27 move that restored
+        # reasoning (effort high, parity with the opus leg); thinking and
+        # cache_ttl are deliberately absent -- there is no TTL to pin on
+        # automatic caching, which is the published comparability caveat on
+        # the HARNESS_SPEC entry.
+        self.assertEqual(HARNESS_SPEC["gpt-5.6-sol"],
+                         {"max_tokens": 16000, "effort": "high", "api": "responses"})
 
     def test_the_promotional_sheet_is_dated_inside_its_window(self) -> None:
         promo, lst = PRICE_SHEETS["gpt-5.6-sol"], PRICE_SHEETS["gpt-5.6-sol@list"]

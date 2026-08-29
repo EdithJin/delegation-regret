@@ -41,11 +41,14 @@ every call through the logging proxy on its own.
 The OpenAI leg landed 2026-08-27 (it was dropped Aug 24 when its go/no-go
 deadline passed unmet; TASKS-AND-OPEN-ISSUES.md section 3): gpt-* models carry
 their own provider-pinned price sheets below -- the price vector is
-provider-specific, not model-specific -- and `build_client` dispatches them to
-`OpenAIClient` via `provider_for`. When a gpt model is selected and --base-url
-/ --api-key-env are left at their Anthropic defaults, `endpoint_defaults`
-re-routes them to https://api.openai.com and OPENAI_API_KEY; explicit flags
-always win, which is how tests point a gpt model at a local fake.
+provider-specific, not model-specific -- and `build_client` dispatches them via
+`provider_for`, by default to `OpenAIResponsesClient` (/v1/responses, the wire
+format that takes tools and reasoning together; a spec pinning "api": "chat"
+selects `OpenAIClient` instead, the dialect OpenAI-compatible open-source
+servers speak). When a gpt model is selected and --base-url / --api-key-env are
+left at their Anthropic defaults, `endpoint_defaults` re-routes them to
+https://api.openai.com and OPENAI_API_KEY; explicit flags always win, which is
+how tests point a gpt model at a local fake.
 """
 
 from __future__ import annotations
@@ -67,7 +70,7 @@ from generator.scenario import Scenario, build_scenario
 from .audit import audit_summary, eps_from_calibration, run_audit
 from .calibrate import PriceSheet, TimingModel
 from .calibration import CalibrationResult, replay, run_calibration
-from .client import AnthropicClient, Client, OpenAIClient
+from .client import AnthropicClient, Client, OpenAIClient, OpenAIResponsesClient
 from .experiment import run_experiment
 from .runner import Budget
 
@@ -157,9 +160,9 @@ HARNESS_SPEC: dict[str, dict] = {
     "claude-sonnet-5": {"thinking": {"type": "adaptive"}, "effort": "high", "cache_ttl": "1h"},
     "claude-haiku-4-5": {"thinking": None, "effort": None, "cache_ttl": "1h"},
     # The OpenAI leg's spec deliberately has NO thinking key (an Anthropic-only
-    # parameter; effort maps to reasoning_effort on this wire format) and NO
-    # cache_ttl: OpenAI prompt caching is automatic -- unbilled on write, with
-    # provider-managed retention that cannot be purchased or pinned.
+    # parameter) and NO cache_ttl: OpenAI prompt caching is automatic --
+    # unbilled on write, with provider-managed retention that cannot be
+    # purchased or pinned.
     # COMPARABILITY CAVEAT, to be published with any cross-provider table: the
     # Anthropic legs run under a pinned one-hour TTL while this leg's cache
     # lifetime floats at the provider's discretion, so cache-hit rates (and the
@@ -167,13 +170,18 @@ HARNESS_SPEC: dict[str, dict] = {
     # retention discipline. max_tokens 16000 matches the --max-tokens default
     # every leg runs under, recorded here so this leg's constants are greppable
     # in one place like the others.
-    # effort "none" is REQUIRED, not chosen: the real endpoint 400s function
-    # tools on /v1/chat/completions unless reasoning_effort is explicitly
+    # "api": "responses" routes `client_for_model` to `OpenAIResponsesClient`,
+    # and effort "high" travels as reasoning={"effort": "high"} -- REASONING
+    # RESTORED, at parity with the opus leg's effort pin. History, kept because
+    # it still governs the chat-completions path: on /v1/chat/completions the
+    # real endpoint 400s function tools unless reasoning_effort is explicitly
     # "none" (verified live 2026-08-27; the default is non-none, so omitting
-    # the field also 400s). Comparability caveat: the opus leg runs effort
-    # "high" — this leg measures gpt-5.6-sol's no-reasoning tool mode. The
-    # reasoning-ON leg requires the /v1/responses wire format (October queue).
-    "gpt-5.6-sol": {"max_tokens": 16000, "effort": "none"},
+    # the field also 400s) -- that error names /v1/responses as the API that
+    # takes tools and reasoning together, which is why this leg moved. The
+    # effort-"none" pin remains the documented configuration for any future
+    # OpenAI-compatible open-source leg, which speaks only chat completions
+    # (spec shape: {"max_tokens": ..., "effort": "none", "api": "chat"}).
+    "gpt-5.6-sol": {"max_tokens": 16000, "effort": "high", "api": "responses"},
 }
 
 
@@ -221,6 +229,19 @@ def client_for_model(model: str, api_key: str, base_url: str,
     """
     spec = HARNESS_SPEC[model]
     if provider_for(model) == "openai":
+        # gpt-* defaults to the responses wire format -- the one that takes
+        # tools and reasoning together. A spec pinning {"api": "chat"} selects
+        # the chat-completions client instead: the dialect OpenAI-compatible
+        # open-source servers speak, where the effort-"none" tools pin applies.
+        if spec.get("api", "responses") == "responses":
+            return OpenAIResponsesClient(
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                effort=spec["effort"],
+            )
         return OpenAIClient(
             model=model,
             api_key=api_key,
@@ -304,8 +325,10 @@ def cmd_models(args) -> int:
     print("    claude-haiku-4-5 (plumbing only) predates adaptive thinking and")
     print("    effort; its spec sends neither.")
     print("    gpt-5.6-sol (OpenAI leg, added 2026-08-27): max_tokens 16000,")
-    print("    reasoning_effort none — REQUIRED for tools on chat completions")
-    print("    (verified live; reasoning-on needs /v1/responses, October);")
+    print("    reasoning effort high over /v1/responses — the wire format that")
+    print("    takes tools and reasoning together (chat completions 400s the")
+    print("    pairing unless effort is none, verified live 2026-08-27; that")
+    print("    effort-none pin still governs the chat path OSS endpoints use);")
     print("    no thinking, no cache TTL (caching automatic).")
     return 0
 
