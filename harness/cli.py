@@ -639,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     aud.add_argument("--out", required=True)
     aud.set_defaults(func=cmd_audit)
 
-    aus = sub.add_parser("audit-summary", help="combine audits into the pre-registered X%")
+    aus = sub.add_parser("audit-summary", help="combine audits into the pre-registered X%%")
     aus.add_argument("dir", help="directory containing per-scenario audit dirs")
     aus.set_defaults(func=cmd_audit_summary)
 
