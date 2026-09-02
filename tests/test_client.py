@@ -109,7 +109,7 @@ class TestToolSurfaceOnTheWire(unittest.TestCase):
 class TestPinnedSpecOnTheWire(unittest.TestCase):
     """The Aug 24 harness-spec pins, checked on the wire.
 
-    Three constants the report publishes -- adaptive thinking, effort, and the
+    Three published constants -- adaptive thinking, effort, and the
     one-hour cache TTL -- plus the breakpoint discipline that makes the TTL
     mean anything: exactly two markers per request, system and conversation
     tail, with the tail marker moving forward each turn and never persisting

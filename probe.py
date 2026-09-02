@@ -174,7 +174,7 @@ def main(argv=None) -> int:
                            "numbers above are not a measurement of the boundary.")
         elif mb is None:
             verdict.append("no latency win at this size -> probe the next rung; if flat there "
-                           "too, decision rule 3 (scoped negative) is the report.")
+                           "too, decision rule 3 (scoped negative) is the finding.")
         else:
             verdict.append(f"MEASURED beta* = ${mb:.3f}/min at node size {args.size} "
                            f"(predicted {'none' if pb is None else f'${pb:.3f}'}).")

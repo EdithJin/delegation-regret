@@ -184,7 +184,7 @@ class OrderingReport:
 
     Deliberately blunt about the conclusion, because the temptation is to report
     "mostly agreed" and move on. If the ordering does not hold, every computed
-    plan cost in the report is suspect, and that has to be said rather than
+    plan cost in the results is suspect, and that has to be said rather than
     softened.
     """
 
@@ -241,7 +241,7 @@ class PlanCompliance:
     follow instructions", which is the actual finding and a reportable one.
 
     A low rate is not a reason to relax the compliance check. It is a reason to
-    say so in the report: regret over execution plans is only measurable on models
+    say so in the findings: regret over execution plans is only measurable on models
     that can be told which plan to execute.
     """
 

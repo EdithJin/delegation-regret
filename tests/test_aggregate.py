@@ -65,7 +65,7 @@ class TestManifest(unittest.TestCase):
         self.assertEqual(set(counts), {"wide", "chain", "diamond", "mixed"})
 
     def test_the_fingerprint_changes_when_the_spec_list_does(self) -> None:
-        # This is what makes pre-registration checkable: a mix widened after
+        # This is what makes prospective specification checkable: a mix widened after
         # seeing an unflattering aggregate leaves a trace.
         widened = Manifest(name="core", specs=CORE.specs + (ScenarioSpec("wide", 4, 3, 99),))
         self.assertNotEqual(widened.fingerprint, CORE.fingerprint)

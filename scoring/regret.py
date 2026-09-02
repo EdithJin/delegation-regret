@@ -157,7 +157,7 @@ def stakes(dag: DAG, cm: CostModel, beta: float, results=None, floors=None) -> S
 
 @dataclass(frozen=True)
 class ScoreCard:
-    """One scenario, one beta, one model. The unit the report aggregates."""
+    """One scenario, one beta, one model. The unit the aggregation consumes."""
 
     scenario_id: str
     beta: float
@@ -387,7 +387,7 @@ def implied_beta(
     which is itself a finding rather than a missing measurement.
 
     Returns the convex hull when a k is optimal on several disjoint intervals.
-    That is deliberately conservative for this report's purpose: a wider reported
+    That is deliberately conservative for this benchmark's purpose: a wider reported
     range makes a model look MORE rationalizable, so it cannot manufacture the
     incoherence result.
 

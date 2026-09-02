@@ -76,7 +76,7 @@ class TestStatedBetaDirective(unittest.TestCase):
 
     def test_frozen_wordings_have_not_drifted(self) -> None:
         # The instrument constants, pinned. Changing them between cells makes
-        # runs incomparable; changing them at all requires re-pre-registering.
+        # runs incomparable; changing them requires a new prospective specification.
         self.assertIn("$1.00 per", DIRECTIVE_B1)
         self.assertIn("minimizing total cost = dollars spent + $1.00 x elapsed minutes",
                       DIRECTIVE_B1)

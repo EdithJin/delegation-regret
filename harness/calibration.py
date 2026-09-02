@@ -1081,8 +1081,8 @@ def run_calibration(
     EVERY RUN GOES THROUGH THE LOGGING PROXY, and `require_proxy` defaults to
     True for a reason specific to calibration. A client-side error in parsing the
     provider's usage block would be invisible in a single run, and here it would
-    be baked into every constant -- and then into every dollar figure the report
-    reports. The proxy parses the same blocks with different code, so a
+    be baked into every constant -- and then into every reported dollar
+    figure. The proxy parses the same blocks with different code, so a
     disagreement surfaces as a note on the trace. With `require_proxy` the
     disagreement aborts the extraction instead of being averaged into a curve.
     """

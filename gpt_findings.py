@@ -1,7 +1,7 @@
-"""Recompute the report's GPT-only findings from saved artifacts.
+"""Recompute the reported GPT-only findings from saved artifacts.
 
 All canonical and supplemental GPT artifacts are stored in this checkout.
-This script prints the exact denominators used by the report. In particular,
+This script prints the exact reported denominators. In particular,
 it does not silently pool the reasoning-none retry runs with the canonical
 matrix.
 
@@ -377,7 +377,7 @@ def paired_packed_ladder(price: PriceSheet, timing: TimingModel) -> dict:
             "repeats_per_size": len(PACKED_CONFIRM_REPEATS),
             "paired_probes": len(flat),
             "paid_arms": 2 * len(flat),
-            "preregistration": "GPT-PACKED-LADDER-PREREG.md",
+            "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
         },
         "runs": runs,
         "admission": ratio(flat, lambda row: row["admitted"]),
@@ -441,7 +441,7 @@ def figure_payload(
                 "Pre-registered paired packed-mode ladder: two fresh serial/fanout "
                 "pairs per size; all eight fanout arms packed in one batch."
             ),
-            "preregistration": "GPT-PACKED-LADDER-PREREG.md",
+            "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
             "runs": packed_confirmatory["runs"],
         },
         "rungs": [
@@ -529,7 +529,7 @@ def main() -> None:
         },
     }
 
-    # Report-facing invariants: fail loudly if an artifact changes underneath a claim.
+    # Reported invariants: fail loudly if an artifact changes underneath a claim.
     assert high_ladder["dominated"] == {"numerator": 4, "runs": 4}
     assert high_ladder["serialized_at_sizes_8_15_25"] == {"numerator": 3, "runs": 3}
     assert high_matrix["runs"]["succeeded"] == high_matrix["runs"]["all"] == 35
@@ -569,7 +569,7 @@ def main() -> None:
         "repeats_per_size": 2,
         "paired_probes": 8,
         "paid_arms": 16,
-        "preregistration": "GPT-PACKED-LADDER-PREREG.md",
+        "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
     }
     assert packed_confirm["admission"] == {"numerator": 8, "runs": 8}
     assert packed_confirm["packing_obedience"] == {"numerator": 8, "runs": 8}

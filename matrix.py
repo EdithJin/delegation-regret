@@ -1,6 +1,6 @@
 """The discriminating mini-matrix — the run design captured as code.
 
-Pre-registered in DATASET-BOUNDARY-DEFECT.md section 5 (the stated-beta
+Prospectively specified in DATASET-BOUNDARY-DEFECT.md section 5 (the stated-beta
 amendment; wording of the objective directives below is an INSTRUMENT CONSTANT,
 frozen at sign-off — do not edit between cells). One invocation executes one
 cell in its own fresh process (the probe pattern, which is what makes the
@@ -26,7 +26,7 @@ V1 run_python attribution hole. Realized-plan compliance is secondary and is
 attribution-based; treat it as advisory until item 14's module-hashing fix.
 
 Cell ordering matters and is encoded in CELLS: the three intermediate checks
-run FIRST. Re-anchor rule, pre-registered: if `int8-bundle` beats the banked
+run FIRST. Re-anchor rule, specified before execution: if `int8-bundle` beats the banked
 size-8 serial arm on the beta=1 objective (beyond the floors), size 8 is no
 longer serial-correct — skip `w8-stated-b1` and run `w3-stated-b1` instead
 (size 3 is measured-dominated and immune to intermediate-plan risk).
@@ -49,7 +49,9 @@ from harness.runner import Budget, run_agent, run_plan
 
 # INSTRUMENT CONSTANTS — the stated-beta objective directives, appended
 # verbatim to the agent's first user message. Symmetric wording; neither
-# mentions spawning. Frozen at pre-registration sign-off.
+# mentions spawning. Frozen at prospective protocol sign-off. Historical prompt
+# wording says elapsed wall time; scoring uses reconstructed intrinsic time, a
+# validity mismatch documented explicitly in the findings rather than rewritten.
 DIRECTIVE_B1 = (
     "\n\nObjective: treat elapsed wall-clock time as a real cost of $1.00 per "
     "minute, in addition to API spend. Complete every task while minimizing "
@@ -85,7 +87,8 @@ CELLS = [
     # -- intermediate-plan check (committee logic, runs first) --------------
     dict(id="int8-bundle",  shape="wide", n=4, size=8,  seed=11, cond="ref", plan="bundle1", runs=1, est=0.6,
          note="does k=1 beat serial at size 8? if yes: re-anchor rule fires"),
-    # wide-15 gets the FULL outcome-distinct table instead of a single
+    # wide-15 gets the full predicted-outcome table, later verified to cover
+    # every structural allocation shape, instead of a single
     # intermediate check — it is the flip cell, and full execution is cheap
     # (~11-12 runs after the symmetry/floor collapse). Run via the existing
     # audit machinery, NOT this script:
@@ -95,7 +98,7 @@ CELLS = [
     #     --out results/audit-w15   (~$8-10; also yields the safe-filter X%)
     dict(id="int25-split22", shape="wide", n=4, size=25, seed=11, cond="ref", plan="split22", runs=1, est=1.2,
          note="predicted-best at 25; same one-sided stakes as int15"),
-    # -- the flip pair (the report's core cells) -----------------------------
+    # -- the flip pair (the core cells) -----------------------------
     dict(id="w15-stated-b1", shape="wide", n=4, size=15, seed=11, cond="stated-b1", runs=3, est=0.9,
          correct="delegate", note="flip test; measured margin +$0.25"),
     dict(id="w15-stated-b0", shape="wide", n=4, size=15, seed=11, cond="stated-b0", runs=3, est=0.7,

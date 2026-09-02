@@ -6,8 +6,8 @@ venv/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# Full run traces stay out of history; the published copy ships only a small
-# curated sample, force-added under results/sample/.
+# Full run traces stay out of history; only the curated sample under
+# results/sample/ is tracked.
 results/*
 !results/sample/
 
@@ -15,11 +15,9 @@ results/*
 figures/beta-staircase.svg
 figures/make_beta_staircase.py
 
-# Working documents kept local, deliberately out of history
+# Working notes kept local, deliberately out of history
 TASKS-AND-OPEN-ISSUES.md
-REPORT-EVIDENCE-INDEX.md
 DATASET-BOUNDARY-DEFECT.md
 MATRIX-RESULTS.md
 OPENAI-LEG-PREFLIGHT.md
 RESPONSES-PREFLIGHT.md
-report/

@@ -18,7 +18,7 @@ Three decisions are deliberately hard-coded rather than accepted as flags:
 
 * THE PRICE SHEETS ARE PINNED, NOT PASSED. An undated dollar is not a unit
   (see `calibrate.PriceSheet`), and a rate typed on the command line at 11pm is
-  exactly how a units error enters a report. `--model` selects from `PRICE_SHEETS`;
+  exactly how a units error enters a results table. `--model` selects from `PRICE_SHEETS`;
   changing a rate means editing this file, which leaves a diff.
 * EXPERIMENT REFUSES A CALIBRATION FROM A DIFFERENT MODEL. The block curves are
   read off one model's runs under one price sheet; scoring another model's
@@ -154,7 +154,7 @@ PRICE_SHEETS: dict[str, PriceSheet] = {
 
 # The pinned harness spec (TASKS-AND-OPEN-ISSUES section 2, Aug 24). These are
 # published constants: every measured run uses exactly these values, and the
-# report reports them. The rest of the spec lives where it is enforced --
+# results quote them. The rest of the spec lives where it is enforced --
 # max_tokens 16000 is the --max-tokens default below (thinking and text share
 # the cap on current models; 4096 truncates mid-tool-call), the concurrency cap
 # is tools.MAX_CONCURRENCY = 4 (pinned by test), and fan-out launches
@@ -384,8 +384,8 @@ def cmd_manifest(args) -> int:
     path = write_manifest(manifest, args.out)
     print(manifest.summary())
     print(f"\n  written to {path}")
-    print(f"  COMMIT THIS FILE. The fingerprint {manifest.fingerprint} is the "
-          "pre-registration; uncommitted it is just an assertion.")
+    print(f"  COMMIT THIS FILE. The fingerprint {manifest.fingerprint} makes the "
+          "pre-execution specification checkable; uncommitted it is just an assertion.")
     return 0
 
 
@@ -530,7 +530,7 @@ def cmd_audit(args) -> int:
     calib, timing, cm, floors = _load_calibration(args)
     if floors[0] is None:
         raise SystemExit(
-            "the calibration carries no dollar floor; outcome-distinct collapse "
+            "the calibration carries no dollar floor; predicted-outcome collapse "
             "needs a resolution. Re-run calibration QA first."
         )
     eps = args.eps if args.eps is not None else eps_from_calibration(calib)
@@ -551,7 +551,7 @@ def cmd_audit(args) -> int:
 
 
 def cmd_audit_summary(args) -> int:
-    """Combine per-scenario audits into the report's X% -- the pre-registered
+    """Combine per-scenario audits into the headline X% -- the pre-specified
     worst-case rule, refusing a certified X when any audit cannot contribute."""
     paths = sorted(Path(args.dir).glob("*/audit.json"))
     if not paths:
@@ -600,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
     mod = sub.add_parser("models", help="print the pinned price sheets")
     mod.set_defaults(func=cmd_models)
 
-    man = sub.add_parser("manifest", help="write a pre-registered manifest to disk")
+    man = sub.add_parser("manifest", help="write a fingerprinted manifest to disk")
     man.add_argument("--set", default="core", choices=("core", "anchor", "heldout"))
     man.add_argument("--seeds", help="core only: keep these seeds, e.g. '11,23' trims 36 -> 24")
     man.add_argument("--heldout-count", type=int, default=12)
@@ -639,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     aud.add_argument("--out", required=True)
     aud.set_defaults(func=cmd_audit)
 
-    aus = sub.add_parser("audit-summary", help="combine audits into the pre-registered X%%")
+    aus = sub.add_parser("audit-summary", help="combine audits into the pre-specified X%%")
     aus.add_argument("dir", help="directory containing per-scenario audit dirs")
     aus.set_defaults(func=cmd_audit_summary)
 

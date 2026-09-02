@@ -3,7 +3,7 @@
 Design doc: Phase1-DelegationBench-Design.md, the week-1 smoke gate. Sprint
 schedule: Sprint-Schedule.md.
 
-Neither test produces a number that appears in the report. Each answers one
+Neither test produces a number that appears in the results. Each answers one
 yes/no question whose answer changes what gets built next, and the entire value
 is in learning it before the thing above it is built rather than after:
 

@@ -4,7 +4,7 @@ Design doc: Phase1-DelegationBench-Design.md section 7.
 
 Cost and latency are not observations *about* this benchmark's results -- they
 are the results. Regret is realized cost plus beta times realized latency, so
-every number in the report is downstream of what this file records. That makes a
+every reported number is downstream of what this file records. That makes a
 few things non-negotiable:
 
 TOKENS COME FROM THE PROVIDER, NEVER FROM US. Counting tokens locally with a

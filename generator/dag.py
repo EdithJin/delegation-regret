@@ -139,7 +139,7 @@ class DAG:
 # -- shape families -------------------------------------------------------
 #
 # Four families, chosen because each makes a different plan optimal. Section 6
-# pre-registers the class mix and reports per-class as primary, so these labels
+# prospectively fixes the class mix and reports per-class as primary, so these labels
 # are load-bearing: they are the aggregation unit, not documentation.
 
 

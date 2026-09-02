@@ -13,7 +13,7 @@
   "execution_mode_caveat": "all four forced fan-out arms issued one spawn per assistant turn; reasoning-high free-choice multi-spawn matrix runs packed 21/21",
   "packed_confirmatory": {
     "what": "Pre-registered paired packed-mode ladder: two fresh serial/fanout pairs per size; all eight fanout arms packed in one batch.",
-    "preregistration": "GPT-PACKED-LADDER-PREREG.md",
+    "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
     "runs": {
       "3": [
         {

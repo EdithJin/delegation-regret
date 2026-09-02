@@ -1,6 +1,6 @@
 """What the measurement instrument guarantees, checked without spending anything.
 
-Every dollar figure and every latency in the report is whatever the proxy wrote
+Every reported dollar figure and latency is whatever the proxy wrote
 down. A parser that silently misses the final usage block, or a relay that folds
 generation time into prefill, does not produce an error -- it produces a clean
 table of wrong numbers. So the instrument is tested against payloads whose
@@ -74,7 +74,7 @@ class TestUsageSniffer(unittest.TestCase):
 
     def test_openai_body_is_normalized_onto_the_same_fields(self) -> None:
         # The open-weights leg has to land in the same log as the frontier legs
-        # or the cross-model table is not comparable in the dimension the report
+        # or the cross-model table is not comparable in the dimension the benchmark
         # claims to measure. "Normalized" includes the counting convention:
         # OpenAI's prompt_tokens is INCLUSIVE of cached tokens where Anthropic's
         # input_tokens is exclusive, so the sniffer records the fresh count

@@ -1,8 +1,8 @@
-"""Recompute the report's Kimi K3-only findings from saved artifacts.
+"""Recompute the reported Kimi K3-only findings from saved artifacts.
 
 The matrix, ladder, mini-calibration, and full calibration all live in this
 canonical checkout. This script checks every cell against its trace and proxy
-log and fails loudly if a report-facing denominator changes.
+log and fails loudly if a reported denominator changes.
 
 Run from the benchmark root:
 
@@ -412,7 +412,7 @@ def main() -> None:
         "saved_call_census": saved_calls,
     }
 
-    # Report-facing invariants.
+    # Reported invariants.
     assert ladder["forced_fanout_one_batch"] == {"numerator": 4, "runs": 4}
     assert ladder["aggregate_output_exceeds_serial"] == {"numerator": 4, "runs": 4}
     assert ladder["floor_cleared_finite_boundaries"] == [25]

@@ -789,7 +789,7 @@ def optimal_k_intervals(
     real plan achieves. That fictional point is weakly better than the true
     per-k optimum at EVERY beta, so every k looks more rationalizable than it
     is -- which inflates the beta-intervals and makes an over-spawning agent
-    look consistent with some latency price. Wrong direction for this report.
+    look consistent with some latency price. Wrong direction for this benchmark.
 
     Done correctly: f_k(beta) = min over plans with exactly k blocks of
     (cost + beta*latency) -- a concave piecewise-linear function of beta. k is

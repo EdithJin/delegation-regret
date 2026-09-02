@@ -1,4 +1,4 @@
-"""The pre-registered scenario set: which scenarios, fixed before any model runs.
+"""The prospectively specified scenario set, fixed before any model runs.
 
 Low-level design: low-level-design.md, sections 1.2 and 1.4.
 
@@ -24,7 +24,7 @@ pooled figure alone.
 
 THREE SETS, AND THEY ARE NOT INTERCHANGEABLE
 
-`CORE`      the pre-registered graded set. Fixed seeds. This is what the
+`CORE`      the prospectively specified graded set. Fixed seeds. This is what the
             headline numbers come from, and it does not change.
 
 `HELDOUT`   generated from a seed range disjoint from CORE, on demand. Because
@@ -119,7 +119,7 @@ class Manifest:
 
         Published alongside results. If the manifest is edited, the fingerprint
         changes, and a results table quoting the old one is visibly stale -- which
-        is the whole point of pre-registering. A mix silently widened after seeing
+        is the whole point of prospective specification. A mix silently widened after seeing
         an unflattering aggregate would otherwise leave no trace.
         """
         blob = json.dumps([asdict(s) for s in self.specs], sort_keys=True).encode()
@@ -170,7 +170,7 @@ _CORE_SEEDS = (11, 23, 37)
 CORE = Manifest(
     name="core",
     note=(
-        "Pre-registered graded set. Equal counts per shape so the pooled figure is "
+        "Prospectively specified graded set. Equal counts per shape so the pooled figure is "
         "an unweighted mean of the four classes. Fixed seeds; do not edit without "
         "changing the fingerprint and saying so."
     ),
@@ -185,7 +185,7 @@ CORE = Manifest(
 #
 # Three nodes, one size, both interesting shapes: this is the worked example the
 # design doc walks through by hand. Kept because a benchmark whose smallest case
-# cannot be checked on report is a benchmark nobody can audit.
+# cannot be checked with pencil and arithmetic is a benchmark nobody can audit.
 
 ANCHOR = Manifest(
     name="anchor",

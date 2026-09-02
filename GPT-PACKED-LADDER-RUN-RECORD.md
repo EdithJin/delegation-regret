@@ -49,7 +49,7 @@ break-even value; it is reported as an instruction-obedience or dominance
 outcome, never discarded. Dollar and minute differences are interpreted
 against the reasoning-high calibration floors.
 
-## Outcome-independent report mapping
+## Outcome-independent read-off
 
 - finite, floor-clearing values: report the GPT packed-mode boundary by size;
 - packed but dominated: concurrency does not cover overhead at that size;

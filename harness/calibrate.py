@@ -55,7 +55,7 @@ class PriceSheet:
     """Dollars per million tokens, by category, for one model on one date.
 
     `as_of` is not decoration. Section 7 makes billed dollars the currency of
-    every number in the report, and an undated dollar is not a unit -- provider
+    every reported number, and an undated dollar is not a unit -- provider
     prices move, and a curve measured under one price sheet does not compose
     with a matrix run under another. Record it, publish it, and refuse to mix.
     """
