@@ -26,8 +26,9 @@ from harness.calibration import bundled_plan, materiality_floor
 from harness.client import AnthropicClient, Reply, ScriptedClient, ToolRequest
 from harness.experiment import Results, run_experiment
 from harness.protocol_upstream import ProtocolUpstream, Turn
-from harness.runner import run_agent, through_proxy
-from harness.trace import LEAD, Trace, WriteEvent
+from harness.proxy import CallRecord
+from harness.runner import _cross_check, run_agent, through_proxy
+from harness.trace import LEAD, ModelCall, Trace, WriteEvent
 from scoring.validate import out_of_order_edits, out_of_order_rate
 
 PRICE = PriceSheet("fake", "2026-08-23", 3.0, 15.0, 0.3, 3.75)
@@ -137,6 +138,38 @@ class TestProxyCrossCheck(unittest.TestCase):
             C.AnthropicClient.complete = original
         self.assertFalse(trace.proxy_verified)
         self.assertTrue(any(n.startswith("PROXY MISMATCH") for n in trace.notes), trace.notes)
+
+    def test_a_cache_write_mismatch_is_caught(self) -> None:
+        trace = Trace(
+            scenario_id="s",
+            model="fake",
+            calls=[
+                ModelCall(
+                    actor=LEAD,
+                    index=0,
+                    input_tokens=2,
+                    output_tokens=10,
+                    cache_write_tokens=900,
+                )
+            ],
+        )
+        record = CallRecord(
+            seq=1,
+            path="/v1/messages",
+            input_tokens=2,
+            output_tokens=10,
+            cache_read_tokens=0,
+            cache_write_tokens=800,
+        )
+
+        class Proxy:
+            records = [record]
+
+        _cross_check(trace, Proxy())
+        self.assertFalse(trace.proxy_verified)
+        self.assertTrue(
+            any("cache_write_tokens" in note for note in trace.notes), trace.notes
+        )
 
     def test_scoring_refuses_a_trace_that_failed_the_cross_check(self) -> None:
         from scoring.regret import score

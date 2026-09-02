@@ -11,6 +11,7 @@ structurally. Nothing here tests a model; all of it tests the harness.
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -527,6 +528,7 @@ class TestTraceRoundTrip(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             trace = run_agent(scn, client, tmp)
             path = trace.write(Path(tmp) / "trace.json")
+            self.assertEqual(json.loads(path.read_text())["schema_version"], 1)
             back = Trace.load(path)
         self.assertEqual(back.node_attribution, trace.node_attribution)
         self.assertEqual(back.verdicts, trace.verdicts)

@@ -42,6 +42,7 @@ from .proxy import CallRecord
 from .tools import MAX_CONCURRENCY
 
 __all__ = [
+    "TRACE_SCHEMA_VERSION",
     "ModelCall",
     "WriteEvent",
     "SpawnRecord",
@@ -51,6 +52,7 @@ __all__ = [
     "batch_makespan",
 ]
 
+TRACE_SCHEMA_VERSION = 1
 LEAD = "lead"
 
 
@@ -274,6 +276,7 @@ class Trace:
 
     def to_json(self) -> str:
         payload = asdict(self)
+        payload["schema_version"] = TRACE_SCHEMA_VERSION
         payload["spawns"] = [asdict(s) for s in self.spawns]
         payload["write_events"] = [asdict(w) for w in self.write_events]
         payload["calls"] = [asdict(c) for c in self.calls]
@@ -287,6 +290,15 @@ class Trace:
     @classmethod
     def load(cls, path: str | Path) -> "Trace":
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        # Archived traces predate the explicit field but already have the v1
+        # shape. Treat an absent version as v1 so the historical artifact stays
+        # replayable; reject future shapes rather than silently misreading them.
+        schema_version = raw.pop("schema_version", TRACE_SCHEMA_VERSION)
+        if schema_version != TRACE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported trace schema {schema_version!r}; "
+                f"expected {TRACE_SCHEMA_VERSION}"
+            )
         raw["calls"] = [ModelCall(**{**c, "tools_invoked": tuple(c["tools_invoked"])}) for c in raw["calls"]]
         raw["spawns"] = [SpawnRecord(**{**s, "files": tuple(s["files"])}) for s in raw["spawns"]]
         raw["calls"] = raw["calls"]

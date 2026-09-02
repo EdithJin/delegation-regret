@@ -140,7 +140,15 @@ def _cross_check(trace: Trace, proxy: LoggingProxy | None) -> None:
             "cannot be trusted."
         )
         return
-    for field_name in ("input_tokens", "output_tokens", "cache_read_tokens"):
+    # Every field that can affect the invoice must agree.  Cache writes are a
+    # separately billed Anthropic usage class; omitting them would let the two
+    # parsers disagree on dollars while still stamping the run verified.
+    for field_name in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ):
         seen = sum(getattr(r, field_name) or 0 for r in records)
         claimed = sum(getattr(c, field_name) for c in trace.calls)
         if seen != claimed:
