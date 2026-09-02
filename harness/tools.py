@@ -138,7 +138,14 @@ class ToolCall:
 
 @dataclass
 class Workspace:
-    """A scenario directory an agent may act inside, and nowhere else.
+    """A scenario directory presented to an agent through file tools.
+
+    `_resolve` confines `list_files`, `read_file`, and `write_file` to `root`.
+    `run_python` is a materially different boundary: it launches a normal Python
+    subprocess with `root` only as its working directory, inherits the parent
+    environment, and adds no filesystem or network sandbox. Mutations made by
+    that subprocess are not entered in `writes`. Callers must not interpret an
+    empty `contested_writes` map as a process-isolation guarantee.
 
     `actor` and `writes` exist for one reason: section 5.4 needs to know WHICH
     loop produced each node's result, and says to capture it AT THE MOMENT OF
@@ -215,6 +222,7 @@ class Workspace:
         return f"wrote {len(content)} characters to {path}"
 
     def run_python(self, code: str) -> str:
+        """Execute Python with a workspace cwd, but without a security sandbox."""
         try:
             done = subprocess.run(
                 [sys.executable, "-c", code],
