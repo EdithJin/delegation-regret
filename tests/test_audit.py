@@ -1,8 +1,8 @@
 """The committee audit, exercised without spending anything.
 
-The audit is the machinery behind the report's X% -- the fraction of the plan
+The audit is the machinery behind the headline X% -- the fraction of the plan
 table the calculation may safely discard -- so its math is pinned offline: the
-outcome collapse, the 2-eps band, the pre-registered scorecard rules, and the
+predicted-outcome collapse, the 2-eps band, the prospectively specified scorecard rules, and the
 compliance gating that keeps an excluded run from quietly becoming a survivor.
 """
 
@@ -16,10 +16,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from generator.dag import sample_dag
-from generator.oracle import Plan, PlanResult
+from generator.oracle import Plan, PlanResult, enumerate_plans
 from generator.scenario import build_scenario
 from harness.audit import (
     AuditResult,
+    allocation_shape_classes,
+    allocation_shape_key,
     audit_summary,
     committee_band,
     distinct_outcomes,
@@ -44,9 +46,30 @@ def pr(cost, latency, k=0, tag="a") -> PlanResult:
 
 
 class TestPureMachinery(unittest.TestCase):
-    def test_same_outcome_collapses_to_the_simplest_plan(self) -> None:
-        # Two plans, indistinguishable at floor resolution: one representative,
-        # and it is the simpler one -- the plan scoring would have executed.
+    def test_wide4_has_52_labeled_plans_and_12_structural_shapes(self) -> None:
+        dag = sample_dag("wide", 4, sizes=(15,), seed=11)
+        plans = enumerate_plans(dag)
+        classes = allocation_shape_classes(dag, plans)
+
+        self.assertEqual(len(plans), 52)
+        self.assertEqual(len(classes), 12)
+        self.assertEqual(
+            sorted(len(members) for members in classes.values()),
+            [1, 1, 1, 3, 4, 4, 4, 4, 6, 6, 6, 12],
+        )
+        self.assertEqual(sum(len(members) for members in classes.values()), 52)
+
+    def test_shape_key_refuses_nonwide_or_heterogeneous_dags(self) -> None:
+        chain = sample_dag("chain", 3, sizes=(1,), seed=7)
+        heterogeneous = sample_dag("wide", 3, sizes=(1, 2), seed=7)
+        self.assertIsNone(allocation_shape_key(chain, enumerate_plans(chain)[0]))
+        self.assertIsNone(
+            allocation_shape_key(heterogeneous, enumerate_plans(heterogeneous)[0])
+        )
+
+    def test_same_predicted_bucket_selects_the_simplest_plan(self) -> None:
+        # Two plans the model cannot distinguish at floor resolution: one
+        # representative, and it is the simpler plan scoring would execute.
         a = pr(1.00, 2.00, k=2, tag="x")
         b = pr(1.01, 2.01, k=0, tag="y")  # within the 0.05 floors of a
         reps = distinct_outcomes([a, b], FLOORS)
@@ -54,7 +77,7 @@ class TestPureMachinery(unittest.TestCase):
         self.assertEqual(reps[0].plan.k, 0)
         self.assertEqual(outcome_key(a, FLOORS), outcome_key(b, FLOORS))
 
-    def test_distinct_outcomes_stay_distinct(self) -> None:
+    def test_distinct_predicted_outcomes_stay_distinct(self) -> None:
         reps = distinct_outcomes([pr(1.0, 1.0), pr(2.0, 1.0), pr(1.0, 3.0)], FLOORS)
         self.assertEqual(len(reps), 3)
 
@@ -130,9 +153,14 @@ class TestRunAudit(unittest.TestCase):
         self.assertTrue(result.rows)
         self.assertTrue(all(r.measured_objective is None for r in result.rows))
         self.assertEqual(reloaded.n_outcomes, result.n_outcomes)
+        self.assertEqual(reloaded.n_shape_classes, result.n_shape_classes)
+        self.assertEqual(
+            sum(row["labeled_plan_count"] for row in reloaded.shape_classes),
+            result.n_plans,
+        )
         self.assertIn("DRY RUN", result.report())
 
-    def test_the_scorecard_applies_the_preregistered_rules(self) -> None:
+    def test_the_scorecard_applies_the_prespecified_rules(self) -> None:
         # Serial measures cheapest (fake runner: cost grows with k). Under the
         # placeholder model serial is also predicted best, so r=1 and
         # x = 1 - 1/N exactly -- the rule, not a curve fit.

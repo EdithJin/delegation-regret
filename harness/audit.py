@@ -1,21 +1,24 @@
 """The committee audit: run every plan that could win, and grade the calculation.
 
-Design record: TASKS-AND-OPEN-ISSUES.md section 4 item 13; REPORT-EVIDENCE-INDEX.md
-section 4. The oracle's measured role is a COMMITTEE -- an exhaustive enumerator
+Design record: TASKS-AND-OPEN-ISSUES.md section 4 item 13. The oracle's
+measured role is a COMMITTEE -- an exhaustive enumerator
 plus a bounded-error pruner whose one unforgivable failure is excluding a plan
 that could actually win. This module is the instrument that grades it, and the
 grade is executed, not argued:
 
   enumerate every legal plan          (the space is finite; no unknown paths)
-  -> collapse to outcome-distinct     (symmetric plans are the same physics;
-     representatives at floor           at noise-floor resolution wide8's 21,147
-     resolution                         plans are 36 outcomes)
+  -> collapse to predicted-outcome   (at noise-floor resolution wide8's 21,147
+     representatives at floor           plans are 36 predicted outcomes)
+     resolution
+  -> cross-check structural shapes   (on equal-size wide DAGs, record whether
+                                        those representatives cover every
+                                        node-relabeling allocation class)
   -> EXECUTE each representative      (compliance-gated, proxy-witnessed --
      via the ordinary forced-plan       every row is a certified run of its
      runner                             assigned plan or an explicit exclusion)
-  -> scorecard                        (the numbers the report prints)
+  -> scorecard                        (the headline numbers)
 
-THE SCORECARD, pre-registered here before any audit data exists, so the rule
+THE SCORECARD, prospectively specified here before any audit data exists, so the rule
 cannot be tuned to the result:
 
   champion retention   Is the MEASURED-best plan inside the model's 2-epsilon
@@ -25,7 +28,7 @@ cannot be tuned to the result:
                        champion's predicted rank (1 = predicted best), N = table
                        size. x = 1 - r/N is the largest bottom fraction of the
                        calculated table discardable on this scenario without
-                       discarding the champion. THE REPORT'S X% IS min(x) ACROSS
+                       discarding the champion. THE REPORTED X% IS min(x) ACROSS
                        AUDITED SCENARIOS, reported with every (r, N) pair, worst
                        case first, never the mean alone.
   rank agreement       Kendall tau between predicted and measured orderings --
@@ -61,6 +64,8 @@ from .runner import Budget, RetryPolicy, run_plan
 __all__ = [
     "outcome_key",
     "distinct_outcomes",
+    "allocation_shape_key",
+    "allocation_shape_classes",
     "committee_band",
     "eps_from_calibration",
     "kendall_tau",
@@ -75,17 +80,19 @@ __all__ = [
 
 
 def outcome_key(result, floors) -> tuple[int, int]:
-    """A plan's (cost, latency) outcome at noise-floor resolution.
+    """A plan's predicted (cost, latency) bucket at floor resolution.
 
-    Two plans with the same key are the same measurement target: running both
-    would spend money re-observing physics the floor says we cannot tell apart.
+    Sharing a key means only that the compositional model cannot resolve the
+    plans at these floors.  It does not establish empirical exchangeability;
+    the independent structural check below records when a stronger symmetry
+    argument is available.
     """
     d, m = floors
     return (round(result.cost / (d or 1e-9)), round(result.latency / (m or 1e-9)))
 
 
 def distinct_outcomes(results, floors) -> list:
-    """One representative per outcome, deterministically chosen.
+    """One representative per predicted-outcome bucket, deterministically chosen.
 
     Among plans sharing an outcome, the representative is the simplest (fewest
     subagents, then lexicographic blocks) -- the same conservative tie-break
@@ -100,6 +107,38 @@ def distinct_outcomes(results, floors) -> list:
     for r in sorted(results, key=plan_sig):
         by_key.setdefault(outcome_key(r, floors), r)
     return sorted(by_key.values(), key=lambda r: (r.cost, r.latency))
+
+
+def allocation_shape_key(dag, plan) -> tuple[int, tuple[int, ...]] | None:
+    """Structural allocation class for an equal-size, independent-work DAG.
+
+    For this deliberately narrow case, node identities do not reach the oracle:
+    a plan is characterized by how many tasks remain inline and the multiset of
+    delegated block sizes.  The key is undefined for dependency edges or
+    heterogeneous node sizes; treating those plans as relabeling-equivalent
+    would silently assume away structure or workload differences.
+
+    This key is independent of the calibrated cost model and its materiality
+    floors.  It therefore cross-checks -- rather than defines -- the audit's
+    historical predicted-outcome collapse.
+    """
+    if dag.edges or len({node.size for node in dag.nodes}) != 1:
+        return None
+    return (
+        len(plan.inline),
+        tuple(sorted(len(block) for block in plan.blocks)),
+    )
+
+
+def allocation_shape_classes(dag, plans) -> dict[tuple[int, tuple[int, ...]], list]:
+    """Group every legal plan by :func:`allocation_shape_key` when defined."""
+    groups: dict[tuple[int, tuple[int, ...]], list] = {}
+    for plan in plans:
+        key = allocation_shape_key(dag, plan)
+        if key is None:
+            return {}
+        groups.setdefault(key, []).append(plan)
+    return groups
 
 
 def committee_band(reps, beta: float, eps: float) -> list:
@@ -152,12 +191,14 @@ def kendall_tau(xs, ys) -> float | None:
 
 @dataclass
 class AuditRow:
-    """One outcome-representative: what the model said, what execution said."""
+    """One predicted-outcome representative: model versus execution."""
 
     tag: str
     k: int
     inline: list = field(default_factory=list)
     blocks: list = field(default_factory=list)
+    shape_key: dict = field(default_factory=dict)
+    shape_class_size: int | None = None
     predicted_cost: float = 0.0
     predicted_latency: float = 0.0
     predicted_objective: float = 0.0
@@ -179,9 +220,17 @@ class AuditResult:
     eps: float | None
     floors: tuple
     n_plans: int  # raw enumeration size
-    n_outcomes: int  # distinct at floor resolution
+    n_outcomes: int  # predicted-outcome representatives at floor resolution
     n_band: int
     rows: list = field(default_factory=list)
+    # Independent structural cross-check for equal-size wide DAGs.  The audit
+    # still selects rows by predicted outcome; these fields say whether that
+    # selection happens to cover every relabeling-defined allocation shape.
+    n_shape_classes: int | None = None
+    n_shape_represented: int | None = None
+    shape_complete: bool | None = None
+    shape_definition: str = ""
+    shape_classes: list = field(default_factory=list)
     # the scorecard
     champion_tag: str | None = None
     champion_predicted_rank: int | None = None  # r: 1 = predicted best
@@ -212,9 +261,15 @@ class AuditResult:
         lines = [
             f"committee audit: {self.scenario_id}  beta={self.beta:g}  "
             f"eps={'-' if self.eps is None else f'{self.eps:.0%}'}",
-            f"  {self.n_plans} plans -> {self.n_outcomes} distinct outcomes -> "
+            f"  {self.n_plans} plans -> {self.n_outcomes} predicted-outcome reps -> "
             f"{self.n_band} in the 2-eps band",
         ]
+        if self.n_shape_classes is not None:
+            lines.append(
+                "  structural shape cross-check: "
+                f"{self.n_shape_represented}/{self.n_shape_classes} represented "
+                f"(complete: {self.shape_complete})"
+            )
         for n in self.notes:
             lines.append(f"  ! {n}")
         for row in self.rows:
@@ -286,6 +341,10 @@ def run_audit(
     plans = enumerate_plans(dag)
     priced = [evaluate(dag, p, cm) for p in plans]
     reps = distinct_outcomes(priced, floors)
+    shape_groups = allocation_shape_classes(dag, plans)
+    represented_shape_keys = {
+        allocation_shape_key(dag, rep.plan) for rep in reps
+    } if shape_groups else set()
     band = committee_band(reps, beta, eps) if eps is not None else list(reps)
     band_keys = {outcome_key(r, floors) for r in band}
     to_run = band if band_only else reps
@@ -298,6 +357,17 @@ def run_audit(
         n_plans=len(plans),
         n_outcomes=len(reps),
         n_band=len(band),
+        n_shape_classes=len(shape_groups) if shape_groups else None,
+        n_shape_represented=len(represented_shape_keys) if shape_groups else None,
+        shape_complete=(
+            represented_shape_keys == set(shape_groups)
+            and len(reps) == len(shape_groups)
+            if shape_groups else None
+        ),
+        shape_definition=(
+            "(inline task count, sorted delegated block task counts)"
+            if shape_groups else ""
+        ),
         dry_run=dry_run,
     )
     if eps is None:
@@ -315,16 +385,43 @@ def run_audit(
     rank_of = {id(r): i + 1 for i, r in enumerate(
         sorted(reps, key=lambda r: (r.objective(beta), r.cost)))}
     for i, rep in enumerate(ordered):
+        shape_key = allocation_shape_key(dag, rep.plan)
         result.rows.append(AuditRow(
             tag=f"plan{i:03d}-k{rep.plan.k}",
             k=rep.plan.k,
             inline=sorted(rep.plan.inline),
             blocks=[sorted(b) for b in rep.plan.blocks],
+            shape_key=(
+                {
+                    "inline_tasks": shape_key[0],
+                    "delegated_block_sizes": list(shape_key[1]),
+                }
+                if shape_key is not None else {}
+            ),
+            shape_class_size=(
+                len(shape_groups[shape_key]) if shape_key is not None else None
+            ),
             predicted_cost=rep.cost,
             predicted_latency=rep.latency,
             predicted_objective=rep.objective(beta),
             in_band=outcome_key(rep, floors) in band_keys,
         ))
+
+    if shape_groups:
+        row_tag_by_key = {
+            allocation_shape_key(dag, rep.plan): row.tag
+            for row, rep in zip(result.rows, ordered)
+        }
+        result.shape_classes = [
+            {
+                "inline_tasks": key[0],
+                "delegated_block_sizes": list(key[1]),
+                "labeled_plan_count": len(members),
+                "predicted_outcome_represented": key in represented_shape_keys,
+                "execution_row": row_tag_by_key.get(key),
+            }
+            for key, members in sorted(shape_groups.items())
+        ]
 
     if dry_run:
         result.write(out_dir)
@@ -383,7 +480,7 @@ def run_audit(
 
 
 def audit_summary(audit_paths) -> dict:
-    """Combine per-scenario audits into the report's numbers.
+    """Combine per-scenario audits into the headline numbers.
 
     THE X% RULE, applied: X = min over audited scenarios of each scenario's
     safe-filter x -- worst case, never the mean. Reported next to every (r, N)
