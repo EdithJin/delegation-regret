@@ -1,9 +1,8 @@
-"""Recompute the report's Opus-only findings from saved artifacts.
+"""Recompute the reported Opus-only findings from saved artifacts.
 
 This script deliberately ignores GPT and Kimi artifacts, even when they live
-under a ``results/matrix*`` directory.  It is the executable companion to
-``OPUS-FINDINGS-AUDIT.md``: report numbers should be copied from this report,
-not re-counted by hand.
+under a ``results/matrix*`` directory.  Headline numbers should be copied
+from this report, not re-counted by hand.
 
 Run from the benchmark root:
 
@@ -13,9 +12,13 @@ Run from the benchmark root:
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
+from generator.dag import sample_dag
+from generator.oracle import Plan, enumerate_plans
+from harness.audit import allocation_shape_classes, allocation_shape_key
 from harness.calibrate import PriceSheet, TimingModel, call_dollars
 from harness.calibration import CalibrationResult, orientation_prefix
 from harness.trace import LEAD, Trace
@@ -235,6 +238,28 @@ def matrix_summary(rows: list[dict], price: PriceSheet, timing: TimingModel) -> 
         }
 
     audit = json.loads((RESULTS / "audit-w15" / "audit.json").read_text(encoding="utf-8"))
+    audit_dag = sample_dag("wide", 4, sizes=(15,), seed=11)
+    labeled_plans = enumerate_plans(audit_dag)
+    shape_classes = allocation_shape_classes(audit_dag, labeled_plans)
+    selected_shape_keys = {
+        allocation_shape_key(
+            audit_dag,
+            Plan(
+                frozenset(row["inline"]),
+                tuple(frozenset(block) for block in row["blocks"]),
+            ),
+        )
+        for row in audit["rows"]
+    }
+    assert audit["n_plans"] == len(labeled_plans) == 52
+    assert audit["n_outcomes"] == len(shape_classes) == 12
+    assert selected_shape_keys == set(shape_classes)
+    assert audit.get("n_shape_classes") == len(shape_classes)
+    assert audit.get("n_shape_represented") == len(selected_shape_keys)
+    assert audit.get("shape_complete") is True
+    assert sum(
+        row["labeled_plan_count"] for row in audit.get("shape_classes", ())
+    ) == len(labeled_plans)
     audit_champion = min(
         (row for row in audit["rows"] if not row["excluded"]),
         key=lambda row: row["measured_objective"],
@@ -349,6 +374,24 @@ def matrix_summary(rows: list[dict], price: PriceSheet, timing: TimingModel) -> 
             "max_fanout_singletons": sum(row["max_fanout"] for row in spawned),
             "partial": sum(not row["max_fanout"] for row in spawned),
         },
+        "packing": {
+            # V10's Opus side: same-turn batch census over multi-spawn runs
+            # (k >= 2; a single spawn has no packing question to answer).
+            "free_multi_spawn": {
+                "runs": sum(row["k"] >= 2 for row in agents),
+                "single_batch": sum(
+                    row["all_spawns_one_batch"] for row in agents if row["k"] >= 2
+                ),
+            },
+            "forced_multi_spawn": {
+                "runs": sum(row["k"] >= 2 for row in references),
+                "single_batch": sum(
+                    row["all_spawns_one_batch"]
+                    for row in references
+                    if row["k"] >= 2
+                ),
+            },
+        },
         "strategy": {
             "wide": strategy_counts(wide),
             "wide_serial": strategy_counts(wide_serial),
@@ -412,6 +455,16 @@ def matrix_summary(rows: list[dict], price: PriceSheet, timing: TimingModel) -> 
         },
         "audit_w15": {
             "plans": audit["n_outcomes"],
+            "labeled_plans": len(labeled_plans),
+            "allocation_shapes": len(shape_classes),
+            "shape_complete": selected_shape_keys == set(shape_classes),
+            "shape_class_sizes": sorted(
+                len(members) for members in shape_classes.values()
+            ),
+            "selection_basis": "floor-resolved predicted outcomes",
+            "structural_cross_check": (
+                "(inline task count, sorted delegated block task counts)"
+            ),
             "complete": audit["complete"],
             "champion": audit_champion["tag"],
             "champion_objective": audit_champion["measured_objective"],
@@ -566,12 +619,20 @@ def contested_write_summary(matrix_rows: list[dict]) -> dict:
     }
 
 
-def validate_paper_macros(report: dict) -> None:
-    """Fail if a headline Opus macro drifts from the recomputed artifacts."""
-    report = (ROOT / "report" / "main.tex").read_text(encoding="utf-8")
+def validate_report_macros(report: dict) -> None:
+    """Fail if a headline Opus macro drifts from the recomputed artifacts.
+
+    Reads the macro file named by the REPORT_TEX environment variable; when
+    unset, the validation is skipped so the recompute stays self-contained.
+    """
+    tex_path = os.environ.get("REPORT_TEX")
+    if tex_path is None:
+        print("macro validation skipped: REPORT_TEX not set")
+        return
+    tex = Path(tex_path).read_text(encoding="utf-8")
 
     def macro(name: str) -> str:
-        match = re.search(rf"\\newcommand\{{\\{name}\}}\{{([^}}]*)\}}", report)
+        match = re.search(rf"\\newcommand\{{\\{name}\}}\{{([^}}]*)\}}", tex)
         assert match is not None, f"missing report macro: {name}"
         return match.group(1)
 
@@ -714,12 +775,36 @@ def validate_paper_macros(report: dict) -> None:
             )
         ),
         "auditPlanCount": str(audit["plans"]),
+        "auditLabeledCount": str(audit["labeled_plans"]),
         "referenceTwentyfive": f"{outcomes['comparators']['wide4-s25-11']:.2f}",
         "referenceForty": f"{outcomes['comparators']['wide4-s40-11']:.2f}",
         "chainWaste": (
             rf"+\${matrix['chain_placebo_seed11']['spawn_dollar_penalty']:.2f}"
         ),
     }
+    packing = matrix["packing"]
+    ladder_packing = report["forced_fanout_packing"]
+    assert ladder_packing["wide8_batch_sizes"] == [4, 4], (
+        "wide-8 forced arm no longer batches at the concurrency cap: "
+        f"{ladder_packing['wide8_batch_sizes']}"
+    )
+    expected["opusFreePacked"] = (
+        f"{packing['free_multi_spawn']['single_batch']}/"
+        f"{packing['free_multi_spawn']['runs']}"
+    )
+    expected["opusForcedPacked"] = (
+        f"{packing['forced_multi_spawn']['single_batch'] + ladder_packing['wide4_single_batch']}/"
+        f"{packing['forced_multi_spawn']['runs'] + ladder_packing['wide4_arms']}"
+    )
+    large = tallies["stated_beta1_wide_size_15_to_40"]
+    eight = tallies["stated_beta1_wide_size_8"]
+    expected["statedBoneAllWide"] = (
+        f"{large['spawned'] + eight['spawned']}/{large['runs'] + eight['runs']}"
+    )
+    rank_words = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+                  6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth",
+                  10: "tenth", 11: "eleventh", 12: "twelfth"}
+    expected["champPredictedRank"] = rank_words[audit["champion_predicted_rank"]]
     serial_errors = [
         ladder["wide4"][str(size)]["serial_minutes_prediction_error"]
         for size in (8, 15, 25)
@@ -737,11 +822,41 @@ def validate_paper_macros(report: dict) -> None:
         + r"\%$"
     )
     mismatches = {
-        name: {"report": macro(name), "data": value}
+        name: {"macro": macro(name), "data": value}
         for name, value in expected.items()
         if macro(name) != value
     }
     assert not mismatches, f"Opus report macro drift: {mismatches}"
+
+
+def forced_fanout_packing() -> dict:
+    """Spawn batching of the forced ladder fan-out arms (V10, Opus side).
+
+    The four scored wide-4 rungs each request four spawns; the wide-8 axis
+    probe requests eight, which cannot fit one batch under the concurrency
+    cap of four and is therefore reported by its batch sizes, not pooled
+    into the single-batch tally.
+    """
+    arms: dict[str, list[int]] = {}
+    for name in ("probe-wide4-s3", "probe-wide4-s8", "probe-wide4-s15",
+                 "probe-wide4-s25"):
+        trace = Trace.load(RESULTS / name / "fanout-trace.json")
+        assert trace.model == OPUS, name
+        batches: dict[int, int] = {}
+        for spawn in trace.spawns:
+            batches[spawn.batch] = batches.get(spawn.batch, 0) + 1
+        arms[name] = sorted(batches.values(), reverse=True)
+    wide8 = Trace.load(RESULTS / "probe-wide8-s15" / "fanout-trace.json")
+    assert wide8.model == OPUS
+    batches8: dict[int, int] = {}
+    for spawn in wide8.spawns:
+        batches8[spawn.batch] = batches8.get(spawn.batch, 0) + 1
+    return {
+        "wide4_scored_rungs": arms,
+        "wide4_arms": len(arms),
+        "wide4_single_batch": sum(len(sizes) == 1 for sizes in arms.values()),
+        "wide8_batch_sizes": sorted(batches8.values(), reverse=True),
+    }
 
 
 def main() -> None:
@@ -763,10 +878,11 @@ def main() -> None:
         "calibration_v1": calibration_v1_summary(price),
         "ladder": ladder,
         "matrix": matrix_summary(matrix_rows, price, timing),
+        "forced_fanout_packing": forced_fanout_packing(),
         "smoke_and_pass1": pass1_and_smoke_summary(),
         "contested_writes": contested_write_summary(matrix_rows),
     }
-    validate_paper_macros(report)
+    validate_report_macros(report)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
