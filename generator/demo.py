@@ -5,11 +5,11 @@
 Every number printed here is *derived* from the cost model in `oracle.py`.
 Nothing is asserted, hand-tuned, or looked up in a table.
 
-Read the shapes, not the dollars: the cost constants in `CostModel` are
-placeholders pending calibration against real API runs. What is real today is
-the structure -- which plans are legal, how the lead's serial timeline bounds
-the gain from fanning out, and how the optimal spawn count moves with the
-price of latency.
+This offline tour deliberately uses illustrative `CostModel` constants. The
+repository's measured constants and results live in `results/`, `figures/`,
+and the README's Findings section. What this demo shows is the structure --
+which plans are legal, how the lead's serial timeline bounds the gain from
+fanning out, and how the optimal spawn count moves with the price of latency.
 """
 
 from __future__ import annotations
@@ -191,21 +191,10 @@ def section_5_scale() -> None:
 
 
 def main() -> None:
-    from .oracle import provenance, unmeasured
-
-    cm0 = CostModel()
-    if not cm0.is_calibrated:
-        names = unmeasured(cm0)
-        print()
-        print("  !! UNCALIBRATED. " + str(len(names)) + " of " + str(len(provenance(cm0))) +
-              " cost constants are placeholders.")
-        print("     Shapes below are real; dollar and minute figures are not measurements.")
-        print("     Worst affected: block_dollars_curve, block_minutes_curve (linear stand-ins,")
-        print("     so spawning can never come out cheaper -- that is the placeholder, not a result).")
-    print("\n  DELEGATION REGRET -- what the machinery does today")
+    print("\n  DELEGATION REGRET -- offline tour")
     print("  " + "-" * 50)
-    print("  Cost constants are PLACEHOLDERS pending calibration.")
-    print("  No model has been measured yet. This is the instrument.")
+    print("  This demo uses illustrative constants so it runs with no API key.")
+    print("  Measured constants and results are in figures/ and the Findings section.")
 
     dags = _scenarios()
     cm = CostModel()
@@ -218,8 +207,8 @@ def main() -> None:
     section_5_scale()
 
     print(f"\n{'=' * 74}")
-    print("  Next: the reference harness that runs a model against a scenario,")
-    print("  cost calibration against real API runs, then the scoring module.")
+    print("  Next: run python billing_audit.py to inspect the tracked execution,")
+    print("  then read the Findings section for the measured result.")
     print(f"{'=' * 74}\n")
 
 

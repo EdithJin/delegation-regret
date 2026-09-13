@@ -16,7 +16,10 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
+
+from harness.cli import PRICE_SHEETS as HARNESS_PRICE_SHEETS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -26,12 +29,12 @@ FIELDS = (
     "cache_read_tokens",
     "cache_write_tokens",
 )
-PRICE_SHEETS = {
-    "claude-haiku-4-5": ROOT / "results" / "preflight-v2" / "calibration.json",
-    "claude-opus-5": ROOT / "results" / "cal-opus-v2" / "calibration.json",
-    "gpt-5.6-sol": ROOT / "results" / "cal-gpt-responses" / "calibration.json",
-    "kimi-k3": ROOT / "results" / "cal-kimi" / "calibration.json",
-}
+AUDITED_MODELS = (
+    "claude-haiku-4-5",
+    "claude-opus-5",
+    "gpt-5.6-sol",
+    "kimi-k3",
+)
 
 
 def proxy_for_trace(trace_path: Path) -> Path | None:
@@ -60,14 +63,17 @@ def field_total(rows: list[dict], field: str) -> int:
 
 
 def load_prices() -> dict[str, dict]:
-    prices: dict[str, dict] = {}
-    for model, path in PRICE_SHEETS.items():
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        sheet = raw["price_sheet"]
-        if sheet["model"] != model:
-            raise ValueError(f"{path}: price-sheet model {sheet['model']!r} != {model!r}")
-        prices[model] = sheet
-    return prices
+    """Use the harness's tracked, dated sheets; results/ may be absent."""
+    return {model: asdict(HARNESS_PRICE_SHEETS[model]) for model in AUDITED_MODELS}
+
+
+def _under(path: Path, parent: Path) -> bool:
+    """Python 3.9-compatible ``Path.is_relative_to``."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def dollars(rows: list[dict], sheet: dict) -> float:
@@ -82,8 +88,23 @@ def dollars(rows: list[dict], sheet: dict) -> float:
 
 def audit(results_dir: Path) -> dict:
     prices = load_prices()
+    trace_paths = sorted(results_dir.rglob("*.json"))
+    all_proxy_paths = sorted(results_dir.rglob("*proxy*.jsonl"))
+
+    # The tracked sample is copied from the private full archive. When both are
+    # present, exclude the copy so the full archive's spend is not counted
+    # twice. On a fresh clone, the sample is the archive and is audited normally.
+    sample_root = ROOT / "results" / "sample"
+    exclude_sample = (
+        results_dir.resolve() == (ROOT / "results").resolve()
+        and any(not _under(path, sample_root) for path in all_proxy_paths)
+    )
+    if exclude_sample:
+        trace_paths = [path for path in trace_paths if not _under(path, sample_root)]
+        all_proxy_paths = [path for path in all_proxy_paths if not _under(path, sample_root)]
+
     pairs: list[tuple[Path, Path, dict]] = []
-    for trace_path in sorted(results_dir.rglob("*.json")):
+    for trace_path in trace_paths:
         proxy_path = proxy_for_trace(trace_path)
         if proxy_path is None:
             continue
@@ -152,7 +173,6 @@ def audit(results_dir: Path) -> dict:
     # which no complete trace exists.  Sum every proxy file exactly once rather
     # than silently conditioning the compute disclosure on trace survival.
     ledger_spend_by_model: Counter[str] = Counter()
-    all_proxy_paths = sorted(results_dir.rglob("*proxy*.jsonl"))
     paired_proxy_paths = {proxy.resolve() for _, proxy, _ in pairs}
     unpaired_proxy_ledgers: list[str] = []
     unpriced_billable_records: list[dict] = []
@@ -183,6 +203,7 @@ def audit(results_dir: Path) -> dict:
 
     return {
         "results_root": str(results_dir.relative_to(ROOT)),
+        "curated_sample_excluded_as_duplicate": exclude_sample,
         "paired_traces": len(pairs),
         "archived_proxy_ledgers": len(all_proxy_paths),
         "archived_proxy_calls": archived_proxy_calls,
