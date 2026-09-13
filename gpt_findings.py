@@ -377,7 +377,7 @@ def paired_packed_ladder(price: PriceSheet, timing: TimingModel) -> dict:
             "repeats_per_size": len(PACKED_CONFIRM_REPEATS),
             "paired_probes": len(flat),
             "paid_arms": 2 * len(flat),
-            "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
+            "run_record": "docs/run-record-gpt-packed-ladder.md",
         },
         "runs": runs,
         "admission": ratio(flat, lambda row: row["admitted"]),
@@ -441,7 +441,7 @@ def figure_payload(
                 "Pre-registered paired packed-mode ladder: two fresh serial/fanout "
                 "pairs per size; all eight fanout arms packed in one batch."
             ),
-            "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
+            "run_record": "docs/run-record-gpt-packed-ladder.md",
             "runs": packed_confirmatory["runs"],
         },
         "rungs": [
@@ -569,7 +569,7 @@ def main() -> None:
         "repeats_per_size": 2,
         "paired_probes": 8,
         "paid_arms": 16,
-        "run_record": "GPT-PACKED-LADDER-RUN-RECORD.md",
+        "run_record": "docs/run-record-gpt-packed-ladder.md",
     }
     assert packed_confirm["admission"] == {"numerator": 8, "runs": 8}
     assert packed_confirm["packing_obedience"] == {"numerator": 8, "runs": 8}

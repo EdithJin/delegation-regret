@@ -27,6 +27,16 @@ audit        committee audit executes every plan that could win; findings script
 
 Success is execution-verified (restored test suites in a clean subprocess — no LLM judge). Dollars come from provider usage against dated price sheets; minutes come from a calibrated analytic clock over the observed call schedule. A trace whose usage disagrees with the proxy is disqualified.
 
+## Findings
+
+![Executed cost, latency, break-even boundary, and allocation-shape audit for Claude Opus](figures/fig1-preview.png)
+
+Under a controlled direct-edit strategy, Opus fan-out is dominated at node size 3, while the measured break-even value of a saved minute falls from $1.85 at size 8 to $0.55 at size 15 and $0.47 at size 25. At the audited wide-15 cell, maximal fan-out scores 2.15 versus serial's 2.53 across all 12 direct-edit allocation shapes, but an observed programmatic-serial execution scores 1.32—lower than every controlled shape—so the boundary is strategy-conditional.
+
+![Per-run spawning and spawn-packing behavior for Opus, GPT, and K3](figures/fig2-preview.png)
+
+On large wide tasks, Opus spawns in 6/10 blind runs versus 2/11 runs given a stated $1-per-minute objective; these are directional contrasts from small, unbalanced cells, not population rates. Execution mode differs just as sharply: Opus packs 14/14 free-choice and 6/6 forced multi-spawn runs, GPT packs 21/21 free-choice but serializes 6/6 forced runs, and K3 packs 4/4 forced ladder arms but spawns in 0/30 free-choice traces.
+
 ## Quick start
 
 Python 3.9+, standard library only (verified on 3.9 and 3.14).
@@ -63,16 +73,33 @@ Each command's `--help` documents its arguments; the experiment driver refuses t
 
 ## Reproducing the findings
 
-The full trace archive stays out of history. Where it is present under `results/`, every reported number regenerates from artifacts:
+The tracked curated sample provides a real execution, its independent proxy ledger, and the measured calibration used to price it:
+
+```bash
+python billing_audit.py          # reconcile usage and compute billed spend
+python opus_findings.py --sample # recompute the sample's cost and analytic time
+```
+
+The full trace archive stays out of history. When restored under `results/`, every headline number regenerates from artifacts:
 
 ```bash
 python opus_findings.py     # Opus tallies, boundary ladder, audit assertions
 python gpt_findings.py      # GPT leg
 python kimi_findings.py     # Kimi K3 leg
-python billing_audit.py     # recheck every saved trace/proxy pair and ledger
+python billing_audit.py     # recheck every archived trace/proxy pair and ledger
 ```
 
 Figures rebuild with matplotlib: `python figures/make_fig1.py` (PDF output directory via `FIG_PDF_DIR`, default `figures/`).
+
+Pre-registered run record: [`docs/run-record-gpt-packed-ladder.md`](docs/run-record-gpt-packed-ladder.md) freezes the GPT packed-ladder repetitions and no-early-stopping rule before paid execution.
+
+## Limitations
+
+- Core scenarios are capped at eight subtasks because exhaustive plan pricing grows rapidly.
+- Figure 1 uses one executed draw per arm at each size; its materiality bars are not sampling intervals.
+- Tasks are synthetic Python packages with deliberately injected defects, so transfer to organic repositories is untested.
+- The enumerator knows the dependency graph that the agent must discover, and its controlled boundary omits that discovery cost.
+- The full trace archive is not in Git history; only the curated, identifier-checked sample is included under `results/sample/`.
 
 ## Layout
 
@@ -85,6 +112,7 @@ Figures rebuild with matplotlib: `python figures/make_fig1.py` (PDF output direc
 | [`harness/proxy.py`](harness/proxy.py) | The independent billing witness every run routes through |
 | [`scoring/regret.py`](scoring/regret.py) | Regret, what it refuses to score, implied β |
 | [`harness/audit.py`](harness/audit.py) | The committee audit and its structural cross-check |
+| [`results/sample/`](results/sample/) | Curated trace/proxy pair plus the measured calibration that prices it |
 | [`tests/`](tests/) | What is actually guaranteed, including regression pins for every correction |
 
 MIT licensed. *Research project, built independently. Questions and objections are welcome — open an issue.*
