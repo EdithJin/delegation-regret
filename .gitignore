@@ -10,6 +10,7 @@ venv/
 # results/sample/ is tracked.
 results/*
 !results/sample/
+!results/sample/**
 
 # Held back until regenerated under measured curves
 figures/beta-staircase.svg

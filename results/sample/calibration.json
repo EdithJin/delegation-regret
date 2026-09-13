@@ -1,0 +1,283 @@
+{
+  "constants": {
+    "absorb_dollars_per_node": 0.004095125,
+    "absorb_minutes": 0.029967618681754515,
+    "absorb_minutes_per_node": 0.00043403086057080913,
+    "block_dollars_curve": [
+      [
+        3,
+        0.029486083333333333
+      ],
+      [
+        5,
+        0.04940482222222223
+      ],
+      [
+        8,
+        0.08872242222222222
+      ],
+      [
+        10,
+        0.11806807407407408
+      ],
+      [
+        11,
+        0.13322064814814816
+      ],
+      [
+        13,
+        0.15986306296296296
+      ],
+      [
+        14,
+        0.17307214074074076
+      ],
+      [
+        16,
+        0.19659155555555557
+      ],
+      [
+        19,
+        0.23902661111111112
+      ],
+      [
+        24,
+        0.2947713888888889
+      ]
+    ],
+    "block_minutes_curve": [
+      [
+        3,
+        0.16481635669083233
+      ],
+      [
+        5,
+        0.26936532798658475
+      ],
+      [
+        8,
+        0.4801249964792432
+      ],
+      [
+        10,
+        0.6239273344926741
+      ],
+      [
+        11,
+        0.6966639233739006
+      ],
+      [
+        13,
+        0.8263526924423514
+      ],
+      [
+        14,
+        0.8907823307201822
+      ],
+      [
+        16,
+        1.003011401843386
+      ],
+      [
+        19,
+        1.201491198722739
+      ],
+      [
+        24,
+        1.4474139575434724
+      ]
+    ],
+    "brief_dollars_per_node": 0.0027214285714285713,
+    "brief_minutes": 0.11101728451787665,
+    "brief_minutes_per_node": 0.01741185378266848,
+    "explore_dollars": 0.025774727272727272,
+    "explore_minutes": 0.14164687231653897,
+    "spawn_fixed_dollars": 0.04904675,
+    "sub_block_dollars_curve": [
+      [
+        3,
+        0.033522666666666666
+      ],
+      [
+        5,
+        0.033522666666666666
+      ],
+      [
+        19,
+        0.0772105
+      ]
+    ],
+    "sub_block_minutes_curve": [
+      [
+        3,
+        0.19654649203682983
+      ],
+      [
+        5,
+        0.19654649203682983
+      ],
+      [
+        19,
+        0.2766534951235501
+      ]
+    ],
+    "throughput_curve": [
+      [
+        1,
+        1.0
+      ],
+      [
+        2,
+        1.0
+      ],
+      [
+        3,
+        1.0
+      ],
+      [
+        4,
+        1.0
+      ]
+    ]
+  },
+  "diagnostics": {
+    "composition": {
+      "arms": [
+        {
+          "all_runs_incomplete": false,
+          "measured_dollars": 0.3698973333333333,
+          "measured_minutes": 1.8011552023773605,
+          "n_runs": 9,
+          "plan": "all-inline",
+          "predicted_dollars": 0.32054611616161616,
+          "predicted_minutes": 1.5890608298600115,
+          "rel_gap_dollars": -0.13341868871286036,
+          "rel_gap_minutes": -0.11775463449091103
+        },
+        {
+          "all_runs_incomplete": false,
+          "measured_dollars": 0.6870454999999999,
+          "measured_minutes": 1.922335117041328,
+          "n_runs": 1,
+          "plan": "max-fanout",
+          "predicted_dollars": 0.5620905487012987,
+          "predicted_minutes": 1.139169843698965,
+          "rel_gap_dollars": -0.1818728909492911,
+          "rel_gap_minutes": -0.4074030934563247
+        },
+        {
+          "all_runs_incomplete": false,
+          "measured_dollars": 0.40948500000000004,
+          "measured_minutes": 1.8759686378026026,
+          "n_runs": 1,
+          "plan": "bundled",
+          "predicted_dollars": 0.2755007153679654,
+          "predicted_minutes": 0.6951007056274583,
+          "rel_gap_dollars": -0.32720193568026823,
+          "rel_gap_minutes": -0.6294710414553317
+        }
+      ],
+      "checked": true,
+      "cost_ranking_preserved": false,
+      "latency_ranking_preserved": false
+    },
+    "dollar_disagreement": {
+      "3": 0.3857412960351351,
+      "5": 0.3709211252068392,
+      "8": 0.15776108996762617,
+      "10": 0.20845444036329727,
+      "11": 0.09898886581381833,
+      "13": 0.15435159724963263,
+      "14": 0.060657983031060736,
+      "16": 0.12849374809760197,
+      "19": 0.1109165204525109,
+      "24": 0.10083068140376177
+    },
+    "dollar_holdout": {
+      "axis": "dollars",
+      "checked": true,
+      "kind": "leave-one-run-out",
+      "max_rel_error": 0.07211571436822678,
+      "mean_rel_error": 0.02916536567153248,
+      "n_runs": 9,
+      "units": 24.0
+    },
+    "explore_calls": 30,
+    "explore_runs": 11,
+    "minute_disagreement": {
+      "3": 0.4299623925808956,
+      "5": 0.4110953367301636,
+      "8": 0.18284798612781145,
+      "10": 0.16503118719337445,
+      "11": 0.1088000852305466,
+      "13": 0.12338175729408644,
+      "14": 0.06100840873792786,
+      "16": 0.10227785693270477,
+      "19": 0.09076950842794196,
+      "24": 0.08258583858573294
+    },
+    "minute_holdout": {
+      "axis": "minutes",
+      "checked": true,
+      "kind": "leave-one-run-out",
+      "max_rel_error": 0.05636179858565679,
+      "mean_rel_error": 0.02609463827873398,
+      "n_runs": 9,
+      "units": 24.0
+    },
+    "n_brief_rows": 8,
+    "n_brief_turns": 4,
+    "n_serial_runs": 9,
+    "n_subagent_blocks": 8,
+    "n_subagents": 8,
+    "sub_units_covered": [
+      3,
+      5,
+      19
+    ],
+    "throughput_samples": {
+      "1": 232,
+      "2": 5,
+      "3": 1,
+      "4": 9
+    },
+    "timing_residual_rms_minutes": 0.01502794648444935
+  },
+  "floors": {
+    "dollars": 0.029721999999999915,
+    "minutes": 0.11953589546442213
+  },
+  "notes": [],
+  "outcome_tol": 0.029721999999999915,
+  "price_sheet": {
+    "as_of": "2026-08-24",
+    "cache_read_per_mtok": 0.5,
+    "cache_write_per_mtok": 10.0,
+    "input_per_mtok": 5.0,
+    "model": "claude-opus-5",
+    "output_per_mtok": 25.0
+  },
+  "skipped": {},
+  "source": "claude-opus-5 calibration cal-opus-v2 @ 2026-08-24",
+  "timing_model": {
+    "a_minutes": 0.029967618681754515,
+    "b_cached_minutes_per_token": null,
+    "b_minutes_per_input_token": 5.299360343955424e-07,
+    "n_calls": 247,
+    "output_tokens_per_minute": 6251.8985178647545,
+    "residual_rms_minutes": 0.01502794648444935
+  },
+  "trace_files": [
+    "results/cal-opus-v2/trace-serial-o0-r0.json",
+    "results/cal-opus-v2/trace-serial-o0-r1.json",
+    "results/cal-opus-v2/trace-serial-o0-r2.json",
+    "results/cal-opus-v2/trace-serial-o1-r0.json",
+    "results/cal-opus-v2/trace-serial-o1-r1.json",
+    "results/cal-opus-v2/trace-serial-o1-r2.json",
+    "results/cal-opus-v2/trace-serial-o2-r0.json",
+    "results/cal-opus-v2/trace-serial-o2-r1.json",
+    "results/cal-opus-v2/trace-serial-o2-r2.json",
+    "results/cal-opus-v2/trace-fanout.json",
+    "results/cal-opus-v2/trace-bundled.json"
+  ]
+}

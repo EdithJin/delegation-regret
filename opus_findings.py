@@ -11,6 +11,7 @@ Run from the benchmark root:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -38,6 +39,58 @@ MODULE_PATH = re.compile(r"^pkg/mod_n\d+\.py$")
 
 def spawn_ratio(numerator: int, denominator: int) -> dict[str, int]:
     return {"spawned": numerator, "runs": denominator}
+
+
+def sample_summary(sample_dir: Path) -> dict:
+    """Summarize the tracked execution without requiring the private archive."""
+    calibration = CalibrationResult.load(sample_dir / "calibration.json")
+    price = PriceSheet(**calibration.price_sheet)
+    timing = TimingModel(**calibration.timing_model)
+    trace_paths = sorted(sample_dir.glob("*-trace.json"))
+    if not trace_paths:
+        raise FileNotFoundError(f"no curated trace found under {sample_dir}")
+
+    executions = []
+    for trace_path in trace_paths:
+        trace = Trace.load(trace_path)
+        if trace.model != price.model:
+            raise ValueError(
+                f"{trace_path}: trace model {trace.model!r} does not match "
+                f"calibration model {price.model!r}"
+            )
+        batches: dict[int, int] = {}
+        for spawn in trace.spawns:
+            batches[spawn.batch] = batches.get(spawn.batch, 0) + 1
+        executions.append(
+            {
+                "trace": str(trace_path.relative_to(ROOT)),
+                "scenario": trace.scenario_id,
+                "condition": trace.condition,
+                "model": trace.model,
+                "calls": len(trace.calls),
+                "subagents": trace.k,
+                "spawn_batch_sizes": sorted(batches.values(), reverse=True),
+                "succeeded": trace.succeeded,
+                "proxy_verified": trace.proxy_verified,
+                "dollars": trace.dollars(price),
+                "analytic_minutes": trace.analytic_minutes(timing),
+                "wall_minutes": trace.wall_seconds / 60.0,
+            }
+        )
+    return {
+        "scope": {
+            "kind": "curated execution sample",
+            "note": "provenance example, not an inferential sample or headline estimate",
+        },
+        "calibration": {
+            "path": str((sample_dir / "calibration.json").relative_to(ROOT)),
+            "source": calibration.source,
+            "model": price.model,
+            "price_sheet_as_of": price.as_of,
+            "materiality_floors": calibration.floors,
+        },
+        "executions": executions,
+    }
 
 
 def load_timekeeper() -> tuple[CalibrationResult, PriceSheet, TimingModel]:
@@ -860,6 +913,17 @@ def forced_fanout_packing() -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="summarize the tracked results/sample artifacts instead of the full archive",
+    )
+    args = parser.parse_args()
+    if args.sample:
+        print(json.dumps(sample_summary(RESULTS / "sample"), indent=2, sort_keys=True))
+        return
+
     calibration, price, timing = load_timekeeper()
     matrix_rows = load_matrix_runs(price, timing)
     ladder = {
